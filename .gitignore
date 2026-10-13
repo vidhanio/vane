@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.direnv/
+result
+result-*
+.env
+.env.*

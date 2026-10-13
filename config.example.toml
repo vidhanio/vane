@@ -1,0 +1,15 @@
+state_dir = "~/.local/state/vidhan-bot"
+herdr_socket = "~/.config/herdr/herdr.sock"
+
+[platforms.discord]
+token = "${DISCORD_TOKEN}"
+guild_id = "123456789012345678"
+channel_id = "123456789012345678"
+allowed_user_ids = ["123456789012345678"]
+
+[agent]
+provider = "anthropic"
+model_id = "claude-sonnet-4-5"
+thinking = "medium"
+cwd = "~/Projects"
+instructions = "Prefer declarative changes in ~/Projects/vidhanix for host configuration."
