@@ -24,6 +24,7 @@ import type {
   PlatformHost,
   SessionInfo,
   SessionRef,
+  ToolCallEvent,
 } from "../platform.ts";
 
 const platformName = "discord";
@@ -43,16 +44,28 @@ const commands = [
     .setDescription("Stop the response running in this session")
     .setContexts(InteractionContextType.Guild),
   new SlashCommandBuilder()
-    .setName("reset")
-    .setDescription("Start a fresh context in this session")
-    .setContexts(InteractionContextType.Guild),
-  new SlashCommandBuilder()
     .setName("status")
     .setDescription("Show this session's activity, model and usage")
     .setContexts(InteractionContextType.Guild),
 ];
 
 const nonce = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 24);
+
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `ERROR:\n\`\`\`\n${message}\n\`\`\``;
+}
+
+interface ToolLine {
+  callId: string;
+  text: string;
+}
+
+interface ToolLog {
+  message?: Message | undefined;
+  lines: ToolLine[];
+  chain: Promise<void>;
+}
 
 class Discord implements Platform {
   readonly name = platformName;
@@ -70,6 +83,8 @@ class Discord implements Platform {
   private stopping = false;
   private readonly running = new Set<Promise<void>>();
   private readonly typing = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly turns = new Map<string, Promise<void>>();
+  private readonly logs = new Map<string, ToolLog>();
 
   constructor(private readonly config: DiscordConfig) {}
 
@@ -121,8 +136,19 @@ class Discord implements Platform {
   }
 
   private onEvent(event: BotEvent): void {
-    if (event.type === "turn-start") this.startTyping(event.session.id);
-    else this.stopTyping(event.session.id);
+    switch (event.type) {
+      case "turn-start":
+        this.startTyping(event.session.id);
+        this.logs.set(event.session.id, { lines: [], chain: Promise.resolve() });
+        return;
+      case "tool-call":
+        this.appendTool(event);
+        return;
+      case "turn-end":
+      case "turn-error":
+        this.stopTyping(event.session.id);
+        return;
+    }
   }
 
   private startTyping(id: string): void {
@@ -169,31 +195,115 @@ class Discord implements Platform {
     const content = message.content.trim();
     if (!content && message.attachments.size === 0) return;
     const thread = message.channel.isThread() ? message.channel : await this.thread(message);
+    const previous = this.turns.get(thread.id) ?? Promise.resolve();
+    const current = previous.then(() => this.run(thread, message, content));
+    const guarded = current.catch(() => undefined);
+    this.turns.set(thread.id, guarded);
+    void guarded.finally(() => {
+      if (this.turns.get(thread.id) === guarded) this.turns.delete(thread.id);
+    });
+    await current;
+  }
+
+  private async run(thread: ThreadChannel, message: Message, content: string): Promise<void> {
     const session: SessionRef = { platform: this.name, id: thread.id };
     try {
-      const [answer] = await Promise.all([
-        this.agent.ask({
-          session,
-          id: message.id,
-          author: message.author.username,
-          text: content,
-          attachments: [...message.attachments.values()].map((item) => ({
-            url: item.url,
-            name: item.name,
-          })),
-        }),
-        this.send(thread, `${message.id}:ack`, "Working on this."),
-      ]);
-      await this.send(thread, `${message.id}:answer`, answer);
+      const answer = await this.agent.ask({
+        session,
+        id: message.id,
+        author: message.author.username,
+        text: content,
+        attachments: [...message.attachments.values()].map((item) => ({
+          url: item.url,
+          name: item.name,
+        })),
+      });
+      await this.finish(thread.id, thread, `${message.id}:answer`, answer);
     } catch (error) {
       console.error(`Session ${thread.id} failed`, error);
       if (!this.stopping)
-        await this.send(
-          thread,
-          `${message.id}:error`,
-          "Could not finish this request. Check the service logs or send another message to continue.",
-        );
+        await this.finish(thread.id, thread, `${message.id}:error`, errorText(error));
     }
+  }
+
+  private appendTool(event: ToolCallEvent): void {
+    const log = this.logs.get(event.session.id);
+    if (!log) return;
+    const text =
+      event.summary === undefined ? `*${event.name}*` : `*${event.name} — ${event.summary}*`;
+    void this.enqueue(log, async () => {
+      const existing = log.lines.find((line) => line.callId === event.callId);
+      if (existing) {
+        if (existing.text === text) return;
+        existing.text = text;
+      } else {
+        log.lines.push({ callId: event.callId, text });
+        if (log.lines.length > 5) log.lines.shift();
+      }
+      await this.showLog(event.session.id, log);
+    });
+  }
+
+  private enqueue(log: ToolLog, task: () => Promise<void>): Promise<void> {
+    const next = log.chain.then(task);
+    log.chain = next.catch((error: unknown) => console.error("Tool log update failed", error));
+    return next;
+  }
+
+  private async showLog(sessionId: string, log: ToolLog): Promise<void> {
+    const content = log.lines.map((line) => line.text).join("\n");
+    if (log.message) {
+      try {
+        await log.message.edit({ content });
+        return;
+      } catch (error) {
+        console.error("Tool message edit failed", error);
+        log.message = undefined;
+      }
+    }
+    const thread = await this.sessionChannel(sessionId);
+    log.message = await thread.send({ content });
+  }
+
+  private async sessionChannel(id: string): Promise<ThreadChannel> {
+    const channel = await this.client.channels.fetch(id);
+    if (!channel?.isThread()) throw new Error(`Session ${id} is not a thread`);
+    if (channel.archived) await channel.setArchived(false);
+    return channel;
+  }
+
+  private async finish(
+    sessionId: string,
+    thread: ThreadChannel,
+    fallbackId: string,
+    text: string,
+  ): Promise<void> {
+    const log = this.logs.get(sessionId);
+    if (!log) {
+      await this.send(thread, fallbackId, text);
+      return;
+    }
+    await this.enqueue(log, async () => {
+      if (log.message) {
+        try {
+          await this.editMessage(log.message, text);
+          return;
+        } catch (error) {
+          console.error("Tool message edit failed", error);
+          log.message = undefined;
+        }
+      }
+      await this.send(thread, fallbackId, text);
+    });
+  }
+
+  private async editMessage(message: Message, text: string): Promise<void> {
+    if (text.length <= 1900) await message.edit({ content: text });
+    else
+      await message.edit({
+        content: "",
+        files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
+      });
   }
 
   private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -208,31 +318,20 @@ class Discord implements Platform {
       return;
     }
     const thread = this.sessionThread(interaction.channel);
-    if (!thread) {
-      await interaction.reply({
-        content: `Use this command in a session thread under <#${this.config.channel_id}>.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
+    const session: SessionRef | undefined = thread
+      ? { platform: this.name, id: thread.id }
+      : undefined;
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const session: SessionRef = { platform: this.name, id: thread.id };
-      const status = await this.agent.status(session);
-      if (!status) {
-        await interaction.editReply("No session has started in this thread yet.");
+      const status = session ? await this.agent.status(session) : undefined;
+      if (!session || !status) {
+        await interaction.editReply("Use this command in a managed session thread.");
         return;
       }
       switch (interaction.commandName) {
         case "stop":
           await this.agent.stop(session);
-          await interaction.editReply(
-            "Stopped the current response. External workers keep running.",
-          );
-          return;
-        case "reset":
-          await this.agent.reset(session);
-          await interaction.editReply("Started a fresh context. Earlier history is kept.");
+          await interaction.editReply("Stopped the current response.");
           return;
         case "status":
           await interaction.editReply({ embeds: [this.sessionEmbed(status)] });
@@ -242,9 +341,7 @@ class Discord implements Platform {
       }
     } catch (error) {
       console.error(`Command ${interaction.commandName} failed`, error);
-      await interaction
-        .editReply("Something went wrong. Check the service logs.")
-        .catch(() => undefined);
+      await interaction.editReply(errorText(error)).catch(() => undefined);
     }
   }
 
@@ -283,7 +380,6 @@ class Discord implements Platform {
     else
       await thread.send({
         ...options,
-        content: `${text.slice(0, 1700)}\n\nFull response attached.`,
         files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
       });
   }

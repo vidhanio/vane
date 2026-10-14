@@ -23,9 +23,22 @@ export interface IncomingMessage {
   readonly attachments?: readonly Attachment[];
 }
 
+/** A tool call observed while a turn is running. */
+export interface ToolCallEvent {
+  readonly type: "tool-call";
+  readonly session: SessionRef;
+  /** The provider's id for the call, stable within the turn. */
+  readonly callId: string;
+  readonly name: string;
+  readonly status: "pending" | "running" | "done";
+  /** Short summary from the tool's last `details()`, when available. */
+  readonly summary?: string;
+}
+
 /** Agent lifecycle events a platform may observe. */
 export type BotEvent =
   | { readonly type: "turn-start"; readonly session: SessionRef }
+  | ToolCallEvent
   | { readonly type: "turn-end"; readonly session: SessionRef; readonly answer: string }
   | { readonly type: "turn-error"; readonly session: SessionRef; readonly error: unknown };
 
@@ -46,8 +59,6 @@ export interface PlatformHost {
   ask(message: IncomingMessage): Promise<string>;
   /** Abort the turn running in a session, if any. */
   stop(session: SessionRef): Promise<void>;
-  /** Abort and clear the context of a session, keeping its history. */
-  reset(session: SessionRef): Promise<void>;
   /** Inspect a session, or undefined when it has not started. */
   status(session: SessionRef): Promise<SessionInfo | undefined>;
   /** Observe agent lifecycle events. Returns an unsubscribe function. */

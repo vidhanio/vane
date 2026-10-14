@@ -9,7 +9,7 @@ import { content } from "./content.ts";
 import { HerdrClient, HerdrError } from "./herdr-client.ts";
 
 const strict = { additionalProperties: false };
-const target = Type.String({ pattern: "^(?:[a-z][a-z0-9_-]{0,31}|w[0-9]+:p[0-9]+)$" });
+const target = Type.String();
 const agentSchema = z.object({
   terminal_id: z.string(),
   pane_id: z.string(),

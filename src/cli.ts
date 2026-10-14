@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { Bot } from "./bot.ts";
 import { loadConfig, type BotConfig } from "./config.ts";
 import type { Platform, PlatformDefinition } from "./platform.ts";
@@ -12,14 +11,9 @@ const definitions: Record<string, PlatformDefinition> = {
 };
 
 function configPath(): string {
-  const args = process.argv.slice(2);
-  if (args.length === 0)
-    return join(
-      process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
-      "vidhan-bot/config.toml",
-    );
-  if (args.length === 2 && args[0] === "--config" && args[1]) return resolve(args[1]);
-  throw new Error("Usage: vidhan-bot [--config PATH]");
+  const file = process.env.VIDHAN_BOT_CONFIG;
+  if (!file) throw new Error("Set VIDHAN_BOT_CONFIG to the config file path");
+  return resolve(file);
 }
 
 function platforms(config: BotConfig): Platform[] {

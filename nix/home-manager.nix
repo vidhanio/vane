@@ -30,14 +30,8 @@ in
     };
     extraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
-      default = [
-        pkgs.git
-        pkgs.bash
-        pkgs.coreutils
-        pkgs.direnv
-        pkgs.nix
-      ];
-      description = "Optional additional host tools. Herdr is included in the bot package.";
+      default = [ ];
+      description = "Optional additional host tools.";
     };
   };
   config = lib.mkIf cfg.enable {
@@ -54,9 +48,12 @@ in
         PartOf = [ "graphical-session.target" ];
       };
       Service = {
-        ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
+        ExecStart = lib.getExe cfg.package;
         WorkingDirectory = config.home.homeDirectory;
-        Environment = "PATH=${lib.makeBinPath cfg.extraPackages}:/run/current-system/sw/bin:${config.home.profileDirectory}/bin";
+        Environment = [
+          "PATH=${lib.makeBinPath cfg.extraPackages}:/run/current-system/sw/bin:${config.home.profileDirectory}/bin"
+          "VIDHAN_BOT_CONFIG=${configFile}"
+        ];
         Restart = "on-failure";
         RestartSec = 5;
         TimeoutStopSec = 90;

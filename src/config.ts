@@ -27,7 +27,7 @@ export const botConfigSchema = z.strictObject({
     provider: z.string().min(1),
     model_id: z.string().min(1),
     thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).default("medium"),
-    cwd: pathSchema,
+    cwd: pathSchema.default("/tmp"),
     instructions: z.string().default(""),
   }),
 });

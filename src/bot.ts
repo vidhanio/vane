@@ -11,6 +11,7 @@ import {
   type Conversation,
   type ConversationId,
   type EntryId,
+  type ToolSlot,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
@@ -42,6 +43,18 @@ function formatMessage(message: IncomingMessage): string {
   for (const attachment of message.attachments ?? [])
     lines.push(`Attachment (untrusted URL): ${attachment.url}`);
   return lines.join("\n");
+}
+
+function toolSummary(details: unknown): string | undefined {
+  if (details === null || typeof details !== "object" || Array.isArray(details)) return undefined;
+  const record = details as Record<string, unknown>;
+  for (const key of ["command", "path", "pattern", "query", "url"]) {
+    const value = record[key];
+    if (typeof value !== "string" || value.length === 0) continue;
+    const line = value.split("\n", 1)[0] ?? value;
+    return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+  }
+  return undefined;
 }
 
 /** Owns conversations, persistence and model calls. Platforms only see this surface. */
@@ -99,7 +112,6 @@ export class Bot {
     return {
       ask: (message) => this.ask(message),
       stop: (session) => this.stop(session),
-      reset: (session) => this.reset(session),
       status: (session) => this.status(session),
       subscribe: (listener) => this.on(platform, listener),
     };
@@ -108,8 +120,10 @@ export class Bot {
   private async ask(message: IncomingMessage): Promise<string> {
     const { session } = message;
     this.emit({ type: "turn-start", session });
+    let poll: { stop(): void } | undefined;
     try {
       const conversation = await this.conversation(session);
+      poll = this.pollTools(session, conversation.id);
       const result = await (
         await conversation.submit(
           {
@@ -120,6 +134,7 @@ export class Bot {
           context,
         )
       ).wait(context);
+      poll.stop();
       const answer =
         result.status === "done" && result.type === "input"
           ? await this.answerText(conversation, result.answer)
@@ -127,21 +142,53 @@ export class Bot {
       this.emit({ type: "turn-end", session, answer });
       return answer;
     } catch (error) {
+      poll?.stop();
       this.emit({ type: "turn-error", session, error });
       throw error;
     }
   }
 
+  private pollTools(session: SessionRef, conversationId: ConversationId): { stop(): void } {
+    const seen = new Map<string, ToolSlot["status"]>();
+    let stopped = false;
+    let pending = false;
+    const timer = setInterval(() => {
+      if (stopped || pending) return;
+      pending = true;
+      void this.harness
+        .snapshot(LiveDoc, conversationId, context)
+        .then((live) => {
+          if (stopped) return;
+          for (const slot of live?.tools ?? []) {
+            if (seen.get(slot.callId) === slot.status) continue;
+            seen.set(slot.callId, slot.status);
+            const summary = toolSummary(slot.details);
+            this.emit({
+              type: "tool-call",
+              session,
+              callId: slot.callId,
+              name: slot.name,
+              status: slot.status,
+              ...(summary === undefined ? {} : { summary }),
+            });
+          }
+        })
+        .catch((error: unknown) => console.error("Tool polling failed", error))
+        .finally(() => {
+          pending = false;
+        });
+    }, 1000);
+    return {
+      stop: () => {
+        stopped = true;
+        clearInterval(timer);
+      },
+    };
+  }
+
   private async stop(session: SessionRef): Promise<void> {
     const conversation = await this.find(session);
     await conversation?.abort(context);
-  }
-
-  private async reset(session: SessionRef): Promise<void> {
-    const conversation = await this.find(session);
-    if (!conversation) return;
-    await conversation.abort(context);
-    await conversation.reset(undefined, context);
   }
 
   private async status(session: SessionRef): Promise<SessionInfo | undefined> {
