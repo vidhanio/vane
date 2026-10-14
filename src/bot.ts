@@ -1,6 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
   configure,
   createRegistry,
@@ -8,7 +7,6 @@ import {
   Harness,
   type Conversation,
   type ConversationId,
-  type UserInput,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
@@ -17,7 +15,6 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { lock } from "proper-lockfile";
 import type { BotConfig } from "./config.ts";
-import { PlatformMessage, type IncomingMessage, type PlatformHost } from "./platform.ts";
 import { botTools } from "./tools.ts";
 import { log } from "./log.ts";
 
@@ -29,17 +26,6 @@ const Sessions = defineDoc<{ platforms: Record<string, Record<string, Conversati
   scope: "session",
   initial: () => ({ platforms: {} }),
 });
-
-function formatMessage(message: IncomingMessage): UserInput {
-  const parts: (TextContent | ImageContent)[] = [
-    { type: "text", text: `${message.author}: ${message.text}` },
-  ];
-  for (const attachment of message.attachments ?? []) {
-    parts.push({ type: "text", text: `Attachment (untrusted URL): ${attachment.url}` });
-    if (attachment.image) parts.push(attachment.image);
-  }
-  return parts;
-}
 
 /** Owns the pi harness and maps platform sessions to its conversations. */
 export class Bot {
@@ -93,43 +79,15 @@ export class Bot {
     }
   }
 
-  /** Bind routing and request ids to one platform. */
-  host(platform: string): PlatformHost {
-    const sessions = async () =>
-      (await this.harness.snapshot(Sessions, context))?.platforms[platform] ?? {};
-    const find = async (id: string) => {
-      const conversationId = (await sessions())[id];
-      return conversationId ? this.harness.conversation(conversationId, context) : undefined;
-    };
-    const conversation = async (id: string) => {
-      const existing = await find(id);
-      if (existing) return existing;
-      return this.conversation(platform, id);
-    };
-    return {
-      sessions: async () => Object.keys(await sessions()),
-      find,
-      conversation,
-      submit: async (message) => {
-        const session = await conversation(message.session);
-        const submission = await session.submit(
-          {
-            type: "input",
-            content: formatMessage(message),
-            requestId: `${platform}:${message.id}`,
-            entry: { kind: PlatformMessage.kind, data: { id: message.id, author: message.author } },
-          },
-          context,
-        );
-        log("message.submitted", {
-          platform,
-          sessionId: message.session,
-          messageId: message.id,
-          submissionId: submission.id,
-        });
-        return submission;
-      },
-    };
+  /** Native conversation ids indexed by an integration's external session ids. */
+  async conversations(namespace: string): Promise<Readonly<Record<string, ConversationId>>> {
+    return (await this.harness.snapshot(Sessions, context))?.platforms[namespace] ?? {};
+  }
+
+  /** Find a routed conversation without creating one. */
+  async findConversation(namespace: string, id: string): Promise<Conversation | undefined> {
+    const conversationId = (await this.conversations(namespace))[id];
+    return conversationId ? this.harness.conversation(conversationId, context) : undefined;
   }
 
   async close(): Promise<void> {
@@ -140,10 +98,13 @@ export class Bot {
     }
   }
 
-  private async conversation(platform: string, id: string): Promise<Conversation> {
+  /** Find or atomically create a routed conversation with the configured agent. */
+  async conversation(namespace: string, id: string): Promise<Conversation> {
+    const found = await this.findConversation(namespace, id);
+    if (found) return found;
     const conversationId = await this.harness.commit(async (tx) => {
       const sessions = await tx.doc(Sessions);
-      const entries = sessions.platforms[platform];
+      const entries = sessions.platforms[namespace];
       const existing = entries?.[id];
       if (existing) return existing;
       const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
@@ -152,12 +113,12 @@ export class Bot {
         thinkingLevel: this.config.agent.thinking,
         cwd: this.config.agent.cwd,
       });
-      sessions.platforms[platform] = { ...entries, [id]: created.id };
-      log("session.created", { platform, sessionId: id, conversationId: created.id });
+      sessions.platforms[namespace] = { ...entries, [id]: created.id };
+      log("session.created", { namespace, sessionId: id, conversationId: created.id });
       return created.id;
     }, context);
     const conversation = await this.harness.conversation(conversationId, context);
-    if (!conversation) throw new Error(`Missing session ${platform}/${id}`);
+    if (!conversation) throw new Error(`Missing session ${namespace}/${id}`);
     return conversation;
   }
 }

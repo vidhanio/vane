@@ -3,13 +3,8 @@
 import { resolve } from "node:path";
 import { Bot } from "./bot.ts";
 import { loadConfig, type BotConfig } from "./config.ts";
-import type { Platform, PlatformDefinition } from "./platform.ts";
-import { discordPlatform } from "./platforms/discord.ts";
+import { Discord } from "./platforms/discord.ts";
 import { log } from "./log.ts";
-
-const definitions: Record<string, PlatformDefinition> = {
-  [discordPlatform.name]: discordPlatform,
-};
 
 function configPath(): string {
   const file = process.env.VIDHAN_BOT_CONFIG;
@@ -17,15 +12,14 @@ function configPath(): string {
   return resolve(file);
 }
 
-function platforms(config: BotConfig): Platform[] {
+function platforms(config: BotConfig, bot: Bot): Discord[] {
   const entries = Object.entries(config.platforms);
   if (entries.length === 0)
     throw new Error("No platforms enabled; add a [platforms.<name>] table to the config");
   return entries.map(([name, raw]) => {
-    const definition = definitions[name];
-    if (!definition) throw new Error(`Unknown platform: ${name}`);
+    if (name !== "discord") throw new Error(`Unknown platform: ${name}`);
     try {
-      return definition.create(raw);
+      return new Discord(bot, raw);
     } catch (error) {
       throw new Error(`Invalid [platforms.${name}] configuration`, { cause: error });
     }
@@ -54,11 +48,12 @@ function waitForShutdown(bot: Bot): Promise<void> {
 async function main(): Promise<void> {
   process.umask(0o077);
   const config = await loadConfig(configPath());
-  const enabled = platforms(config);
-  log("service.starting", { platforms: enabled.map((platform) => platform.name) });
   const bot = await Bot.open(config);
+  let enabled: Discord[] = [];
   try {
-    for (const platform of enabled) await platform.start(bot.host(platform.name));
+    enabled = platforms(config, bot);
+    log("service.starting", { platforms: enabled.map((platform) => platform.name) });
+    for (const platform of enabled) await platform.start();
     console.log(
       `vidhan-bot ready; platforms: ${enabled.map((platform) => platform.name).join(", ")}; state: ${config.state_dir}`,
     );
