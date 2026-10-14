@@ -1,6 +1,13 @@
 import { defineExtension, section } from "@earendil-works/pi-durable";
+import {
+  createBashTool,
+  createEditTool,
+  createReadTool,
+  createWriteTool,
+} from "@earendil-works/pi-durable/tools";
 import type { BotConfig } from "./config.ts";
 import { agentTool } from "./herdr.ts";
+import { displayTool } from "./tool-display.ts";
 
 export function botTools(config: BotConfig) {
   return defineExtension({
@@ -20,6 +27,12 @@ export function botTools(config: BotConfig) {
         { tag: false },
       ),
     ],
-    tools: [agentTool(config)],
+    tools: [
+      displayTool(createReadTool(), (args) => ({ tool: "read", path: args.path })),
+      displayTool(createWriteTool(), (args) => ({ tool: "write", path: args.path })),
+      displayTool(createEditTool(), (args) => ({ tool: "edit", path: args.path })),
+      displayTool(createBashTool(), (args) => ({ tool: "bash", command: args.command })),
+      displayTool(agentTool(config), (args) => ({ tool: "herdr", ...args })),
+    ],
   });
 }

@@ -16,5 +16,6 @@ export type {
   PlatformHost,
   SessionInfo,
   SessionRef,
+  ToolCallDetails,
   ToolCallEvent,
 } from "./platform.ts";

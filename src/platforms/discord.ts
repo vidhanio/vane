@@ -9,6 +9,7 @@ import {
   InteractionContextType,
   MessageFlags,
   SlashCommandBuilder,
+  ThreadAutoArchiveDuration,
   type Channel,
   type ChatInputCommandInteraction,
   type Message,
@@ -16,6 +17,9 @@ import {
   type ThreadChannel,
 } from "discord.js";
 import { createHash } from "node:crypto";
+import { Mutex } from "async-mutex";
+import { log } from "../log.ts";
+import { errorText, messageLimit, readAttachment, renderToolLog } from "./discord-content.ts";
 import { z } from "zod";
 import type {
   BotEvent,
@@ -51,20 +55,19 @@ const commands = [
 
 const nonce = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 24);
 
-function errorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return `ERROR:\n\`\`\`\n${message}\n\`\`\``;
-}
-
-interface ToolLine {
-  callId: string;
-  text: string;
+interface TurnQueue {
+  mutex: Mutex;
+  users: number;
+  thread: ThreadChannel;
 }
 
 interface ToolLog {
   message?: Message | undefined;
-  lines: ToolLine[];
+  lines: ToolCallEvent[];
+  seen: Set<string>;
   chain: Promise<void>;
+  timer?: ReturnType<typeof setTimeout> | undefined;
+  closing: boolean;
 }
 
 class Discord implements Platform {
@@ -83,7 +86,7 @@ class Discord implements Platform {
   private stopping = false;
   private readonly running = new Set<Promise<void>>();
   private readonly typing = new Map<string, ReturnType<typeof setInterval>>();
-  private readonly turns = new Map<string, Promise<void>>();
+  private readonly turns = new Map<string, TurnQueue>();
   private readonly logs = new Map<string, ToolLog>();
 
   constructor(private readonly config: DiscordConfig) {}
@@ -123,23 +126,37 @@ class Discord implements Platform {
       throw new Error("discord channel_id must be a text channel in discord guild_id");
     this.channel = channel;
     this.unsubscribe = host.subscribe((event) => this.onEvent(event));
+    log("discord.connected", {
+      guildId: guild.id,
+      channelId: channel.id,
+      userId: this.client.user?.id,
+    });
   }
 
   async stop(): Promise<void> {
+    log("discord.stopping", { activeTurns: this.running.size });
     this.stopping = true;
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     for (const timer of this.typing.values()) clearInterval(timer);
     this.typing.clear();
     await Promise.allSettled(this.running);
+    for (const entry of this.logs.values()) if (entry.timer) clearTimeout(entry.timer);
+    this.logs.clear();
     await this.client.destroy();
+    log("discord.disconnected");
   }
 
   private onEvent(event: BotEvent): void {
     switch (event.type) {
       case "turn-start":
         this.startTyping(event.session.id);
-        this.logs.set(event.session.id, { lines: [], chain: Promise.resolve() });
+        this.logs.set(event.session.id, {
+          lines: [],
+          seen: new Set(),
+          chain: Promise.resolve(),
+          closing: false,
+        });
         return;
       case "tool-call":
         this.appendTool(event);
@@ -153,11 +170,14 @@ class Discord implements Platform {
 
   private startTyping(id: string): void {
     if (this.typing.has(id)) return;
+    const thread = this.turns.get(id)?.thread ?? this.client.channels.cache.get(id);
+    if (!thread?.isThread()) return;
     const ping = () => {
-      void this.client.channels
-        .fetch(id)
-        .then((channel) => (channel?.isThread() ? channel.sendTyping() : undefined))
-        .catch(() => undefined);
+      void thread
+        .sendTyping()
+        .catch((error: unknown) =>
+          console.error("Discord typing failed", { sessionId: id, error }),
+        );
     };
     ping();
     this.typing.set(id, setInterval(ping, 8000));
@@ -194,32 +214,53 @@ class Discord implements Platform {
   private async handle(message: Message): Promise<void> {
     const content = message.content.trim();
     if (!content && message.attachments.size === 0) return;
-    const thread = message.channel.isThread() ? message.channel : await this.thread(message);
-    const previous = this.turns.get(thread.id) ?? Promise.resolve();
-    const current = previous.then(() => this.run(thread, message, content));
-    const guarded = current.catch(() => undefined);
-    this.turns.set(thread.id, guarded);
-    void guarded.finally(() => {
-      if (this.turns.get(thread.id) === guarded) this.turns.delete(thread.id);
+    log("discord.message_received", {
+      messageId: message.id,
+      channelId: message.channelId,
+      userId: message.author.id,
+      textLength: content.length,
+      attachments: message.attachments.size,
     });
-    await current;
+    const thread = message.channel.isThread() ? message.channel : await this.thread(message);
+    const queue = this.turns.get(thread.id) ?? { mutex: new Mutex(), users: 0, thread };
+    queue.users += 1;
+    this.turns.set(thread.id, queue);
+    try {
+      await queue.mutex.runExclusive(() => this.run(thread, message, content));
+    } finally {
+      queue.users -= 1;
+      if (queue.users === 0) this.turns.delete(thread.id);
+    }
   }
 
   private async run(thread: ThreadChannel, message: Message, content: string): Promise<void> {
     const session: SessionRef = { platform: this.name, id: thread.id };
+    this.startTyping(thread.id);
     try {
+      let imageBytes = 0;
+      let imageCount = 0;
+      const attachments = [];
+      for (const item of message.attachments.values()) {
+        const image =
+          item.contentType?.startsWith("image/") &&
+          imageCount < 4 &&
+          imageBytes + item.size <= 20 * 1024 * 1024;
+        if (image) {
+          imageCount += 1;
+          imageBytes += item.size;
+        }
+        attachments.push(await readAttachment(item, Boolean(image)));
+      }
       const answer = await this.agent.ask({
         session,
         id: message.id,
         author: message.author.username,
         text: content,
-        attachments: [...message.attachments.values()].map((item) => ({
-          url: item.url,
-          name: item.name,
-        })),
+        attachments,
       });
       await this.finish(thread.id, thread, `${message.id}:answer`, answer);
     } catch (error) {
+      this.stopTyping(thread.id);
       console.error(`Session ${thread.id} failed`, error);
       if (!this.stopping)
         await this.finish(thread.id, thread, `${message.id}:error`, errorText(error));
@@ -227,46 +268,50 @@ class Discord implements Platform {
   }
 
   private appendTool(event: ToolCallEvent): void {
-    const log = this.logs.get(event.session.id);
-    if (!log) return;
-    const text =
-      event.summary === undefined ? `*${event.name}*` : `*${event.name} — ${event.summary}*`;
-    void this.enqueue(log, async () => {
-      const existing = log.lines.find((line) => line.callId === event.callId);
-      if (existing) {
-        if (existing.text === text) return;
-        existing.text = text;
-      } else {
-        log.lines.push({ callId: event.callId, text });
-        if (log.lines.length > 5) log.lines.shift();
-      }
-      await this.showLog(event.session.id, log);
-    });
+    const entry = this.logs.get(event.session.id);
+    if (!entry || entry.closing) return;
+    const index = entry.lines.findIndex((line) => line.callId === event.callId);
+    if (index >= 0) entry.lines[index] = event;
+    else {
+      if (entry.seen.has(event.callId)) return;
+      entry.seen.add(event.callId);
+      entry.lines.push(event);
+      if (entry.lines.length > 5) entry.lines.shift();
+    }
+    if (entry.timer) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      void this.enqueue(entry, async () => {
+        if (!entry.closing) await this.showLog(event.session.id, entry);
+      }).catch(() => undefined);
+    }, 750);
   }
 
-  private enqueue(log: ToolLog, task: () => Promise<void>): Promise<void> {
-    const next = log.chain.then(task);
-    log.chain = next.catch((error: unknown) => console.error("Tool log update failed", error));
+  private enqueue(entry: ToolLog, task: () => Promise<void>): Promise<void> {
+    const next = entry.chain.then(task);
+    entry.chain = next.catch((error: unknown) => console.error("Tool log update failed", error));
     return next;
   }
 
-  private async showLog(sessionId: string, log: ToolLog): Promise<void> {
-    const content = log.lines.map((line) => line.text).join("\n");
-    if (log.message) {
+  private async showLog(sessionId: string, entry: ToolLog): Promise<void> {
+    const content = renderToolLog(entry.lines);
+    if (!content || entry.message?.content === content) return;
+    if (entry.message) {
       try {
-        await log.message.edit({ content });
+        entry.message = await entry.message.edit({ content });
         return;
       } catch (error) {
         console.error("Tool message edit failed", error);
-        log.message = undefined;
+        entry.message = undefined;
       }
     }
     const thread = await this.sessionChannel(sessionId);
-    log.message = await thread.send({ content });
+    entry.message = await thread.send({ content });
+    log("discord.tool_log_created", { threadId: thread.id, messageId: entry.message.id });
   }
 
   private async sessionChannel(id: string): Promise<ThreadChannel> {
-    const channel = await this.client.channels.fetch(id);
+    const channel = this.turns.get(id)?.thread ?? (await this.client.channels.fetch(id));
     if (!channel?.isThread()) throw new Error(`Session ${id} is not a thread`);
     if (channel.archived) await channel.setArchived(false);
     return channel;
@@ -276,37 +321,62 @@ class Discord implements Platform {
     sessionId: string,
     thread: ThreadChannel,
     fallbackId: string,
-    text: string,
+    text: string | undefined,
   ): Promise<void> {
-    const log = this.logs.get(sessionId);
-    if (!log) {
-      await this.send(thread, fallbackId, text);
+    const entry = this.logs.get(sessionId);
+    if (!entry) {
+      if (text !== undefined) await this.send(thread, fallbackId, text);
       return;
     }
-    await this.enqueue(log, async () => {
-      if (log.message) {
-        try {
-          await this.editMessage(log.message, text);
+    entry.closing = true;
+    if (entry.timer) clearTimeout(entry.timer);
+    try {
+      await this.enqueue(entry, async () => {
+        if (text === undefined) {
+          await entry.message
+            ?.delete()
+            .catch((error: unknown) => console.error("Could not remove stopped tool log", error));
           return;
-        } catch (error) {
-          console.error("Tool message edit failed", error);
-          log.message = undefined;
         }
-      }
-      await this.send(thread, fallbackId, text);
-    });
+        if (entry.message) {
+          try {
+            await this.editMessage(entry.message, text);
+            return;
+          } catch (error) {
+            console.error("Tool message edit failed", error);
+            entry.message = undefined;
+          }
+        }
+        await this.send(thread, fallbackId, text);
+      });
+    } finally {
+      if (this.logs.get(sessionId) === entry) this.logs.delete(sessionId);
+    }
   }
 
   private async editMessage(message: Message, text: string): Promise<void> {
-    if (text.length <= 1900) await message.edit({ content: text });
-    else
-      await message.edit({
-        content: "",
-        files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
-      });
+    await message.edit(
+      text.length <= messageLimit
+        ? { content: text }
+        : {
+            content: "",
+            files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
+          },
+    );
+    log("discord.response_edited", {
+      messageId: message.id,
+      channelId: message.channelId,
+      textLength: text.length,
+      attachment: text.length > messageLimit,
+    });
   }
 
   private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    log("discord.command_received", {
+      command: interaction.commandName,
+      userId: interaction.user.id,
+      channelId: interaction.channelId,
+    });
     if (
       interaction.guildId !== this.config.guild_id ||
       !this.config.allowed_user_ids.includes(interaction.user.id)
@@ -331,7 +401,7 @@ class Discord implements Platform {
       switch (interaction.commandName) {
         case "stop":
           await this.agent.stop(session);
-          await interaction.editReply("Stopped the current response.");
+          await interaction.deleteReply();
           return;
         case "status":
           await interaction.editReply({ embeds: [this.sessionEmbed(status)] });
@@ -363,25 +433,32 @@ class Discord implements Platform {
   }
 
   private async thread(message: Message): Promise<ThreadChannel> {
-    const starter = await message.fetch();
-    return (
-      starter.thread ??
-      (await starter.startThread({
-        name: message.content.replace(/\s+/g, " ").slice(0, 100) || "New session",
-        autoArchiveDuration: 1440,
-      }))
-    );
+    if (message.thread) return message.thread;
+    const thread = await message.startThread({
+      name: message.cleanContent.replace(/\s+/g, " ").slice(0, 100).toWellFormed() || "New session",
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+    });
+    log("discord.thread_created", { threadId: thread.id, messageId: message.id });
+    return thread;
   }
 
   private async send(thread: ThreadChannel, id: string, text: string): Promise<void> {
     if (thread.archived) await thread.setArchived(false);
     const options = { nonce: nonce(id), enforceNonce: true };
-    if (text.length <= 1900) await thread.send({ ...options, content: text });
-    else
-      await thread.send({
-        ...options,
-        files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
-      });
+    const message = await thread.send(
+      text.length <= messageLimit
+        ? { ...options, content: text }
+        : {
+            ...options,
+            files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
+          },
+    );
+    log("discord.response_sent", {
+      threadId: thread.id,
+      messageId: message.id,
+      textLength: text.length,
+      attachment: text.length > messageLimit,
+    });
   }
 }
 

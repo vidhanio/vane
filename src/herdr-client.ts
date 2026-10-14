@@ -86,6 +86,7 @@ export class HerdrClient {
   async *watchAgent(paneId: string, context: Context, timeout = 35_000) {
     const subscriptions = [
       { type: "pane.agent_status_changed", pane_id: paneId },
+      { type: "pane.scroll_changed", pane_id: paneId },
       { type: "pane.updated" },
       { type: "pane.agent_detected" },
       { type: "pane.exited" },
@@ -103,8 +104,16 @@ export class HerdrClient {
         started = true;
         yield;
       } else {
-        z.object({ event: z.string(), data: z.unknown() }).parse(frame);
-        yield;
+        const event = z
+          .object({
+            event: z.string(),
+            data: z.object({
+              pane_id: z.string().optional(),
+              pane: z.object({ pane_id: z.string() }).optional(),
+            }),
+          })
+          .parse(frame);
+        if ((event.data.pane_id ?? event.data.pane?.pane_id) === paneId) yield;
       }
     }
   }

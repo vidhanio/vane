@@ -1,8 +1,10 @@
 import type { Context } from "@earendil-works/chord";
+import { withCancel } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
-import { defineTool } from "@earendil-works/pi-durable";
+import { defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import { Mutex } from "async-mutex";
 import { stat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { pathSchema, type BotConfig } from "./config.ts";
 import { content } from "./content.ts";
@@ -13,14 +15,22 @@ const target = Type.String();
 const agentSchema = z.object({
   terminal_id: z.string(),
   pane_id: z.string(),
-  name: z.string().nullish(),
-  agent: z.string().nullish(),
+  name: z.string().nullish().default(null),
+  agent: z.string().nullish().default(null),
+  title: z.string().nullish().default(null),
+  terminal_title_stripped: z.string().nullish().default(null),
   agent_status: z.enum(["idle", "done", "working", "blocked", "unknown"]),
   interactive_ready: z.boolean().default(false),
   launch_pending: z.boolean().default(false),
-  cwd: z.string().nullish(),
+  cwd: z.string().nullish().default(null),
 });
 type Agent = z.infer<typeof agentSchema>;
+export const herdrProgressSchema = z.object({
+  agents: z.array(agentSchema),
+  report: z.string(),
+  truncated: z.boolean(),
+  note: z.string(),
+});
 const agentResult = z.object({ agent: agentSchema });
 const waitTimeout = 30 * 60_000;
 
@@ -56,11 +66,66 @@ async function report(client: HerdrClient, agent: Agent, context: Context) {
   }
 }
 
+async function publishReport(
+  api: ToolExecutionApi,
+  result: Awaited<ReturnType<typeof report>>,
+  context: Context,
+  note = "",
+) {
+  await api.details(
+    {
+      agents: [result.agent],
+      report: result.report,
+      truncated: "truncated" in result ? result.truncated : false,
+      note: note || ("read_error" in result ? result.read_error : ""),
+    },
+    context,
+  );
+}
+
+async function withProgress<T>(
+  client: HerdrClient,
+  agent: Agent,
+  api: ToolExecutionApi,
+  context: Context,
+  work: () => Promise<T>,
+): Promise<T> {
+  const child = withCancel(context);
+  const updates = (async () => {
+    const events = client.watchAgent(agent.pane_id, child.context, waitTimeout + 5000);
+    let lastUpdate = 0;
+    try {
+      while (!(await events.next()).done) {
+        await delay(Math.max(0, 1000 - (Date.now() - lastUpdate)), undefined, {
+          signal: child.context.abortSignal,
+        });
+        const current = await get(client, agent.pane_id, child.context);
+        if (current.terminal_id !== agent.terminal_id)
+          throw new Error("Worker replaced while streaming progress");
+        await publishReport(api, await report(client, current, child.context), child.context);
+        lastUpdate = Date.now();
+      }
+    } catch (error) {
+      if (!child.context.abortSignal?.aborted)
+        console.error("Herdr progress stream failed", { paneId: agent.pane_id, error });
+    } finally {
+      await events.return(undefined);
+    }
+  })();
+  try {
+    return await work();
+  } finally {
+    child.cancel();
+    await updates;
+  }
+}
+
 async function start(
   client: HerdrClient,
   paneId: string,
   name: string,
   kind: "pi" | "claude" | "codex",
+  api: ToolExecutionApi,
   context: Context,
 ) {
   const events = client.watchAgent(paneId, context);
@@ -82,12 +147,14 @@ async function start(
       const current = await get(client, name, context);
       if (current.terminal_id !== launched.terminal_id || current.name !== name)
         throw new Error("Worker was replaced during startup");
+      const result = await report(client, current, context);
+      await publishReport(api, result, context);
       if (
         current.agent_status === "blocked" ||
         current.interactive_ready ||
         !current.launch_pending
       )
-        return report(client, current, context);
+        return result;
       await events.next();
     }
   } finally {
@@ -138,14 +205,13 @@ export function agentTool(config: BotConfig) {
       { type: "object" },
     ),
     execute: async (args, api, context) => {
-      if (args.action === "list")
-        return {
-          content: content(
-            z
-              .object({ agents: z.array(agentSchema) })
-              .parse(await client.request("agent.list", {}, context)),
-          ),
-        };
+      if (args.action === "list") {
+        const result = z
+          .object({ agents: z.array(agentSchema) })
+          .parse(await client.request("agent.list", {}, context));
+        await api.details({ ...result, report: "", truncated: false, note: "" }, context);
+        return { output: content(result) };
+      }
       if (args.action === "start") {
         const project = pathSchema.parse(args.project);
         if (!(await stat(project)).isDirectory())
@@ -164,12 +230,13 @@ export function agentTool(config: BotConfig) {
         api.output(`Starting ${args.name} in ${project}…\n`);
         try {
           return {
-            content: content(
+            output: content(
               await start(
                 client,
                 workspace.root_pane.pane_id,
                 args.name,
                 args.kind ?? "pi",
+                api,
                 context,
               ),
             ),
@@ -183,8 +250,9 @@ export function agentTool(config: BotConfig) {
         }
       }
       const agent = await get(client, args.agent, context);
-      if (args.action === "inspect")
-        return { content: content(await report(client, agent, context)) };
+      const initial = await report(client, agent, context);
+      await publishReport(api, initial, context);
+      if (args.action === "inspect") return { output: content(initial) };
       return mutex(agent.pane_id).runExclusive(async () => {
         context.abortSignal?.throwIfAborted();
         const current = await get(client, agent.pane_id, context);
@@ -194,46 +262,46 @@ export function agentTool(config: BotConfig) {
           args.action === "delegate" &&
           current.agent_status !== "idle" &&
           current.agent_status !== "done"
-        )
-          return {
-            content: content({
-              ...(await report(client, current, context)),
-              submitted: false,
-              reason: "Worker is busy, blocked or unknown. Wait or ask the user; no task was sent.",
-            }),
-          };
+        ) {
+          const final = await report(client, current, context);
+          const reason =
+            "Worker is busy, blocked or unknown. Wait or ask the user; no task was sent.";
+          await publishReport(api, final, context, reason);
+          return { output: content({ ...final, submitted: false, reason }) };
+        }
         api.output(
           `${args.action === "delegate" ? "Delegating to" : "Waiting for"} ${current.name ?? current.pane_id}…\n`,
         );
         try {
-          const result =
+          const result = await withProgress(client, current, api, context, () =>
             args.action === "delegate"
-              ? await client.request(
+              ? client.request(
                   "agent.prompt",
                   { target: current.pane_id, text: args.task, wait: { timeout_ms: waitTimeout } },
                   context,
                   waitTimeout + 5000,
                 )
-              : await client.request(
+              : client.request(
                   "agent.wait",
                   { target: current.pane_id, timeout_ms: waitTimeout },
                   context,
                   waitTimeout + 5000,
-                );
-          return {
-            content: content({
-              ...(await report(client, agentResult.parse(result).agent, context)),
-              submitted: args.action === "delegate",
-            }),
-          };
+                ),
+          );
+          const final = await report(client, agentResult.parse(result).agent, context);
+          await publishReport(api, final, context);
+          return { output: content({ ...final, submitted: args.action === "delegate" }) };
         } catch (error) {
           context.abortSignal?.throwIfAborted();
+          const final = await report(client, await get(client, current.pane_id, context), context);
+          const message = error instanceof Error ? error.message : String(error);
+          await publishReport(api, final, context, message);
           return {
-            content: content({
-              ...(await report(client, await get(client, current.pane_id, context), context)),
+            output: content({
+              ...final,
               submitted: args.action === "delegate" ? "uncertain" : false,
               timed_out: error instanceof HerdrError && error.code === "timeout",
-              error: error instanceof Error ? error.message : String(error),
+              error: message,
               note: "Inspect existing work before resending. The task was not automatically retried.",
             }),
           };

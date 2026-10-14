@@ -1,5 +1,7 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import type { Models } from "@earendil-works/pi-ai/models";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   configure,
@@ -8,14 +10,15 @@ import {
   Harness,
   LiveDoc,
   UsageDoc,
+  watchEvents,
   type Conversation,
   type ConversationId,
   type EntryId,
-  type ToolSlot,
+  type ToolRegistration,
+  type UserInput,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
-import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { lock } from "proper-lockfile";
@@ -28,6 +31,8 @@ import type {
   SessionRef,
 } from "./platform.ts";
 import { botTools } from "./tools.ts";
+import { ToolCalls } from "./tool-events.ts";
+import { log } from "./log.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -38,33 +43,26 @@ const Sessions = defineDoc<{ platforms: Record<string, Record<string, Conversati
   initial: () => ({ platforms: {} }),
 });
 
-function formatMessage(message: IncomingMessage): string {
-  const lines = [`${message.author}: ${message.text}`];
-  for (const attachment of message.attachments ?? [])
-    lines.push(`Attachment (untrusted URL): ${attachment.url}`);
-  return lines.join("\n");
-}
-
-function toolSummary(details: unknown): string | undefined {
-  if (details === null || typeof details !== "object" || Array.isArray(details)) return undefined;
-  const record = details as Record<string, unknown>;
-  for (const key of ["command", "path", "pattern", "query", "url"]) {
-    const value = record[key];
-    if (typeof value !== "string" || value.length === 0) continue;
-    const line = value.split("\n", 1)[0] ?? value;
-    return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+function formatMessage(message: IncomingMessage, images: boolean): UserInput {
+  const parts: (TextContent | ImageContent)[] = [
+    { type: "text", text: `${message.author}: ${message.text}` },
+  ];
+  for (const attachment of message.attachments ?? []) {
+    parts.push({ type: "text", text: `Attachment (untrusted URL): ${attachment.url}` });
+    if (images && attachment.image) parts.push(attachment.image);
   }
-  return undefined;
+  return parts;
 }
 
 /** Owns conversations, persistence and model calls. Platforms only see this surface. */
 export class Bot {
-  private readonly listeners = new Set<(event: BotEvent) => void>();
+  private readonly listeners = new Set<(event: BotEvent) => void | Promise<void>>();
 
   private constructor(
     readonly harness: Harness,
     readonly config: BotConfig,
     private readonly release: () => Promise<void>,
+    private readonly models: Models,
   ) {}
 
   static async open(input: unknown): Promise<Bot> {
@@ -80,7 +78,6 @@ export class Bot {
     });
     try {
       const registry = createRegistry();
-      registry.install(CodingTools);
       registry.install(botTools(config));
       const storage = await openNodeJsonlStorage(join(config.state_dir, "sessions"), context, {
         fsync: true,
@@ -100,7 +97,12 @@ export class Bot {
         throw error;
       });
       harness.resume();
-      return new Bot(harness, config, release);
+      log("agent.opened", {
+        stateDir: config.state_dir,
+        provider: config.agent.provider,
+        model: config.agent.model_id,
+      });
+      return new Bot(harness, config, release, models);
     } catch (error) {
       await release();
       throw error;
@@ -117,76 +119,102 @@ export class Bot {
     };
   }
 
-  private async ask(message: IncomingMessage): Promise<string> {
+  private async ask(message: IncomingMessage): Promise<string | undefined> {
     const { session } = message;
+    log("turn.started", {
+      ...session,
+      messageId: message.id,
+      textLength: message.text.length,
+      attachments: message.attachments?.length ?? 0,
+    });
     this.emit({ type: "turn-start", session });
-    let poll: { stop(): void } | undefined;
+    let stopTools: (() => Promise<void>) | undefined;
     try {
       const conversation = await this.conversation(session);
-      poll = this.pollTools(session, conversation.id);
+      const agent = await conversation.agent(context);
+      stopTools = await this.watchTools(session, conversation, agent.tools);
+      const model = agent.model
+        ? this.models.getModel(agent.model.provider, agent.model.modelId)
+        : undefined;
+      const images = model?.input.includes("image") ?? false;
+      if (!images && message.attachments?.some((attachment) => attachment.image)) {
+        log("agent.images_unsupported", {
+          ...session,
+          provider: agent.model?.provider,
+          model: agent.model?.modelId,
+        });
+      }
       const result = await (
         await conversation.submit(
           {
             type: "input",
-            content: formatMessage(message),
+            content: formatMessage(message, images),
             requestId: `${session.platform}:${message.id}`,
           },
           context,
         )
       ).wait(context);
-      poll.stop();
+      await stopTools();
       const answer =
         result.status === "done" && result.type === "input"
           ? await this.answerText(conversation, result.answer)
-          : `Session ended without an answer: ${result.status === "unanswered" ? result.reason : result.status}.`;
-      this.emit({ type: "turn-end", session, answer });
+          : result.status === "unanswered" && result.reason === "aborted"
+            ? undefined
+            : `Session ended without an answer: ${result.status === "unanswered" ? result.reason : result.status}.`;
+      log("turn.finished", {
+        ...session,
+        messageId: message.id,
+        status: result.status,
+        answerLength: answer?.length ?? 0,
+      });
+      this.emit({ type: "turn-end", session, ...(answer === undefined ? {} : { answer }) });
       return answer;
     } catch (error) {
-      poll?.stop();
+      await stopTools?.();
       this.emit({ type: "turn-error", session, error });
       throw error;
     }
   }
 
-  private pollTools(session: SessionRef, conversationId: ConversationId): { stop(): void } {
-    const seen = new Map<string, ToolSlot["status"]>();
+  private async watchTools(
+    session: SessionRef,
+    conversation: Conversation,
+    tools: readonly ToolRegistration[],
+  ): Promise<() => Promise<void>> {
+    const calls = new ToolCalls(session, tools);
     let stopped = false;
-    let pending = false;
-    const timer = setInterval(() => {
-      if (stopped || pending) return;
-      pending = true;
-      void this.harness
-        .snapshot(LiveDoc, conversationId, context)
-        .then((live) => {
-          if (stopped) return;
-          for (const slot of live?.tools ?? []) {
-            if (seen.get(slot.callId) === slot.status) continue;
-            seen.set(slot.callId, slot.status);
-            const summary = toolSummary(slot.details);
-            this.emit({
-              type: "tool-call",
-              session,
-              callId: slot.callId,
-              name: slot.name,
-              status: slot.status,
-              ...(summary === undefined ? {} : { summary }),
-            });
-          }
-        })
-        .catch((error: unknown) => console.error("Tool polling failed", error))
-        .finally(() => {
-          pending = false;
-        });
-    }, 1000);
-    return {
-      stop: () => {
-        stopped = true;
-        clearInterval(timer);
-      },
+    const stream = await watchEvents(this.harness, conversation.id, context);
+    for (const call of calls.snapshot(stream.snapshot)) this.emit(call);
+    stream.start(async (events) => {
+      for (const event of events) {
+        if (stopped) return;
+        if (event.type === "snapshot") {
+          for (const call of calls.snapshot(event)) this.emit(call);
+          continue;
+        }
+        const call = calls.update(event);
+        if (!call) continue;
+        if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+          log(event.type === "tool_execution_start" ? "tool.started" : "tool.finished", {
+            ...session,
+            callId: call.callId,
+            tool: call.name,
+          });
+        }
+        this.emit(call);
+      }
+    });
+    void stream.closed.then((end) => {
+      if (!stopped) console.error("Tool event stream closed unexpectedly", { ...session, end });
+    });
+    return async () => {
+      stopped = true;
+      await stream.stop();
     };
   }
 
   private async stop(session: SessionRef): Promise<void> {
+    log("turn.stop_requested", { ...session });
     const conversation = await this.find(session);
     await conversation?.abort(context);
   }
@@ -235,12 +263,30 @@ export class Bot {
   }
 
   private emit(event: BotEvent): void {
-    for (const listener of this.listeners) listener(event);
+    for (const listener of this.listeners) {
+      try {
+        const work = listener(event);
+        if (work)
+          void Promise.resolve(work).catch((error: unknown) =>
+            console.error("Platform listener failed", {
+              type: event.type,
+              session: event.session,
+              error,
+            }),
+          );
+      } catch (error) {
+        console.error("Platform listener failed", {
+          type: event.type,
+          session: event.session,
+          error,
+        });
+      }
+    }
   }
 
-  private on(platform: string, listener: (event: BotEvent) => void): () => void {
+  private on(platform: string, listener: (event: BotEvent) => void | Promise<void>): () => void {
     const scoped = (event: BotEvent) => {
-      if (event.session.platform === platform) listener(event);
+      if (event.session.platform === platform) return listener(event);
     };
     this.listeners.add(scoped);
     return () => {
@@ -279,6 +325,7 @@ export class Bot {
         cwd: this.config.agent.cwd,
       });
       sessions.platforms[ref.platform] = { ...platform, [ref.id]: created.id };
+      log("session.created", { ...ref, conversationId: created.id });
       return created.id;
     }, context);
     const conversation = await this.harness.conversation(id, context);
