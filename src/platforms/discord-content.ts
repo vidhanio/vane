@@ -1,12 +1,40 @@
-import { codeBlock, escapeMarkdown, type Attachment as DiscordAttachment } from "discord.js";
+import {
+  AttachmentBuilder,
+  codeBlock,
+  Colors,
+  EmbedBuilder,
+  escapeMarkdown,
+  type Attachment as DiscordAttachment,
+} from "discord.js";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { JsonObject, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+  LiveDoc,
+  UsageDoc,
+  type Conversation,
+  type ConversationView,
+  type EntryId,
+  type LiveState,
+  type UsageState,
+} from "@earendil-works/pi-durable";
 import { stripVTControlCharacters } from "node:util";
 import { herdrProgressSchema } from "../herdr.ts";
-import type { Attachment, ToolCallDetails, ToolCallEvent } from "../platform.ts";
+import type { Attachment } from "../platform.ts";
 import { log } from "../log.ts";
 
 export const messageLimit = 1900;
 const imageLimit = 10 * 1024 * 1024;
 const imageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+export function responseOptions(text: string) {
+  return text.length <= messageLimit
+    ? { content: text, files: [], attachments: [] }
+    : {
+        content: "",
+        files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
+        attachments: [],
+      };
+}
 
 function codeText(text: string): string {
   return stripVTControlCharacters(text).replaceAll("`", "`\u200b");
@@ -17,28 +45,21 @@ export function errorText(error: unknown): string {
   return `ERROR:\n${codeBlock(codeText(message).toWellFormed())}`;
 }
 
-function detailText(details: ToolCallDetails): string {
-  switch (details.tool) {
-    case "bash": {
-      const command = details.command.replace(/\s+/g, " ").trim();
-      return command.length > 50 ? `${command.slice(0, 49)}…` : command;
-    }
-    case "read":
-    case "write":
-    case "edit":
-      return details.path;
-    case "herdr": {
-      const target = details.agent ?? details.name;
-      return target === undefined ? details.action : `${details.action} ${target}`;
-    }
-  }
+function detailText(name: string, args: JsonObject): string {
+  if (name === "bash")
+    return String(args.command ?? "")
+      .replace(/\s+/g, " ")
+      .slice(0, 50);
+  if (name === "read" || name === "write" || name === "edit") return String(args.path ?? "");
+  if (name === "herdr") return [args.action, args.agent ?? args.name].filter(Boolean).join(" ");
+  return "";
 }
 
-function toolOutput(event: ToolCallEvent): string {
-  if (event.name === "bash") return event.output ?? "";
-  if (event.name !== "herdr") return "";
-  const parsed = herdrProgressSchema.safeParse(event.resultDetails);
-  if (!parsed.success) return event.output ?? "";
+function toolOutput(name: string, output: string, details: unknown): string {
+  if (name === "bash") return output;
+  if (name !== "herdr") return "";
+  const parsed = herdrProgressSchema.safeParse(details);
+  if (!parsed.success) return output;
   const { agents, report, truncated, note } = parsed.data;
   const rows = agents.map((agent) =>
     [
@@ -58,13 +79,33 @@ function toolOutput(event: ToolCallEvent): string {
   return rows.join("\n");
 }
 
-export function renderToolLog(events: readonly ToolCallEvent[]): string {
-  const headers = events.map((event) => {
-    const detail = event.details ? detailText(event.details) : "";
-    const label = `${event.name}${detail ? ` — ${detail}` : ""}`.replace(/\s+/g, " ");
+export function renderToolLog(view: ConversationView, input: EntryId): string {
+  const calls: ToolCall[] = [];
+  const results = new Map<string, ToolResultMessage>();
+  for (const entry of view.entries) {
+    if (entry.id < input) continue;
+    for (const message of entry.model ?? []) {
+      if (message.role === "toolResult") results.set(message.toolCallId, message);
+      if (message.role === "assistant")
+        for (const block of message.content) if (block.type === "toolCall") calls.push(block);
+    }
+  }
+  const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
+  const recent = calls.slice(-5);
+  const headers = recent.map((call) => {
+    const detail = detailText(call.name, call.arguments);
+    const label = `${call.name}${detail ? ` — ${detail}` : ""}`.replace(/\s+/g, " ");
     return `*${escapeMarkdown(label.slice(0, 140).toWellFormed())}*`;
   });
-  const outputs = events.map((event) => codeText(toolOutput(event)));
+  const outputs = recent.map((call) => {
+    const slot = live?.tools?.find((tool) => tool.callId === call.id);
+    const result = results.get(call.id);
+    const output =
+      slot?.output ??
+      result?.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n") ??
+      "";
+    return codeText(toolOutput(call.name, output, slot?.details ?? result?.details));
+  });
   const active = outputs.filter(Boolean).length;
   const budget = Math.max(0, messageLimit - headers.join("\n").length - active * 10);
   const perCall = active ? Math.min(600, Math.floor(budget / active)) : 0;
@@ -79,11 +120,54 @@ export function renderToolLog(events: readonly ToolCallEvent[]): string {
     .join("\n");
 }
 
+export async function sessionEmbed(conversation: Conversation): Promise<EmbedBuilder> {
+  const agent = await conversation.agent(BACKGROUND_CONTEXT);
+  const view = await conversation.viewState(BACKGROUND_CONTEXT);
+  const live = view.value.docs[LiveDoc.definition.kind] as LiveState | undefined;
+  const usage = view.value.docs[UsageDoc.definition.kind] as UsageState | undefined;
+  view.dispose();
+  const running = live?.tools?.findLast((tool) => tool.status === "running");
+  const activity = !live?.run
+    ? "idle"
+    : live.compactions?.length
+      ? "compacting"
+      : running
+        ? `using ${running.name}`
+        : live.generation
+          ? "thinking"
+          : "working";
+  let tokens = 0;
+  let cost = 0;
+  for (const bucket of [usage?.models, usage?.tools])
+    for (const entry of Object.values(bucket ?? {})) {
+      tokens += entry.totalTokens;
+      cost += entry.cost.total;
+    }
+  return new EmbedBuilder()
+    .setColor(Colors.Blurple)
+    .setTitle("Session status")
+    .addFields(
+      { name: "Status", value: activity, inline: true },
+      {
+        name: "Model",
+        value: agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "Not configured",
+        inline: true,
+      },
+      { name: "Thinking", value: agent.thinkingLevel, inline: true },
+      {
+        name: "Usage",
+        value: `${tokens.toLocaleString("en-US")} tokens · $${cost.toFixed(4)}`,
+        inline: true,
+      },
+      { name: "Directory", value: `\`${agent.cwd ?? "Not configured"}\``, inline: false },
+    );
+}
+
 export async function readAttachment(
   item: DiscordAttachment,
   images: boolean,
 ): Promise<Attachment> {
-  const attachment: Attachment = { url: item.url, name: item.name };
+  const attachment: Attachment = { url: item.url };
   const mimeType = item.contentType?.split(";", 1)[0]?.toLowerCase();
   if (!images || !mimeType || !imageTypes.has(mimeType) || item.size > imageLimit)
     return attachment;
