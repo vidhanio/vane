@@ -1,20 +1,23 @@
 import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type {
-  ImageContent,
-  JsonObject,
-  TextContent,
-  ToolCall,
-  ToolResultMessage,
+import {
+  contentText,
+  type ImageContent,
+  type JsonObject,
+  type TextContent,
+  type ToolCall,
+  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   defineDoc,
   defineEntry,
   LiveDoc,
+  SessionFailed,
   UsageDoc,
   type Agent,
   type Conversation,
+  type ConversationId,
   type ConversationView,
   type Cursor,
   type EntryId,
@@ -66,11 +69,11 @@ type DiscordConfig = z.infer<typeof configSchema>;
 const commands = [
   new SlashCommandBuilder()
     .setName("stop")
-    .setDescription("Stop the response running in this session")
+    .setDescription("Stop the response running in this conversation")
     .setContexts(InteractionContextType.Guild),
   new SlashCommandBuilder()
     .setName("status")
-    .setDescription("Show this session's activity, model and usage")
+    .setDescription("Show this conversation's activity, model and usage")
     .setContexts(InteractionContextType.Guild),
 ];
 
@@ -87,8 +90,10 @@ export class Discord {
   private readonly config: DiscordConfig;
   private channel: TextChannel | undefined;
   private stopping = false;
+  private restoring = Promise.resolve();
   private readonly running = new Set<Promise<void>>();
-  private readonly sessions = new Map<string, Promise<DiscordSession>>();
+  private readonly conversations = new Map<string, Promise<DiscordConversation>>();
+  private readonly bindings = new Map<string, ConversationId>();
 
   constructor(
     private readonly bot: Bot,
@@ -104,11 +109,11 @@ export class Discord {
     this.client.on(Events.Error, (error) => console.error("Discord error", error));
     this.client.on(Events.MessageCreate, (message) => {
       if (this.stopping || !this.channel || !this.allowed(message)) return;
-      this.track(this.handle(message));
+      this.track(this.restoring.then(() => this.handle(message)));
     });
     this.client.on(Events.InteractionCreate, (interaction) => {
       if (this.stopping || !this.channel || !interaction.isChatInputCommand()) return;
-      this.track(this.handleCommand(interaction));
+      this.track(this.restoring.then(() => this.handleCommand(interaction)));
     });
     await this.client.login(this.config.token);
     await ready;
@@ -125,16 +130,8 @@ export class Discord {
     if (channel?.type !== ChannelType.GuildText || channel.guildId !== this.config.guild_id)
       throw new Error("discord channel_id must be a text channel in discord guild_id");
     this.channel = channel;
-    for (const [id, conversationId] of Object.entries(await this.bot.conversations(this.name))) {
-      try {
-        const thread = this.sessionThread(await this.client.channels.fetch(id));
-        if (!thread) continue;
-        const conversation = await this.bot.harness.conversation(conversationId, context);
-        if (conversation) await this.attach(thread, conversation);
-      } catch (error) {
-        console.error("Could not restore Discord session", { sessionId: id, error });
-      }
-    }
+    this.restoring = this.restore();
+    await this.restoring;
     log("discord.connected", {
       guildId: guild.id,
       channelId: channel.id,
@@ -146,12 +143,43 @@ export class Discord {
     log("discord.stopping", { activeMessages: this.running.size });
     this.stopping = true;
     await Promise.allSettled(this.running);
-    const sessions = await Promise.all(this.sessions.values());
-    await Promise.allSettled(sessions.map((session) => session.conversation.waitForIdle(context)));
-    await Promise.allSettled(sessions.map((session) => session.close()));
-    this.sessions.clear();
+    const conversations = await Promise.all(this.conversations.values());
+    await Promise.allSettled(conversations.map((item) => item.conversation.waitForIdle(context)));
+    await Promise.allSettled(conversations.map((item) => item.close()));
+    this.conversations.clear();
+    this.bindings.clear();
     await this.client.destroy();
     log("discord.disconnected");
+  }
+
+  private async restore(): Promise<void> {
+    let cursor: Cursor | undefined;
+    do {
+      const page = await this.bot.harness.commit(
+        (tx) => tx.scanConversations({}, 100, cursor),
+        context,
+      );
+      for (const record of page.items) {
+        const connection = await this.bot.harness.snapshot(DiscordConnection, record.id, context);
+        if (!connection?.threadId) continue;
+        this.bindings.set(connection.threadId, record.id);
+        try {
+          const thread = this.configuredThread(
+            await this.client.channels.fetch(connection.threadId),
+          );
+          if (!thread) continue;
+          const conversation = await this.bot.harness.conversation(record.id, context);
+          if (conversation) await this.attach(thread, conversation);
+        } catch (error) {
+          console.error("Could not restore Discord conversation", {
+            conversationId: record.id,
+            threadId: connection.threadId,
+            error,
+          });
+        }
+      }
+      cursor = page.next;
+    } while (cursor);
   }
 
   private track(work: Promise<void>): void {
@@ -161,15 +189,47 @@ export class Discord {
     this.running.add(tracked);
   }
 
-  private attach(thread: ThreadChannel, conversation: Conversation): Promise<DiscordSession> {
-    const existing = this.sessions.get(thread.id);
-    if (existing) return existing;
-    const session = DiscordSession.open(conversation, thread).catch((error: unknown) => {
-      this.sessions.delete(thread.id);
-      throw error;
-    });
-    this.sessions.set(thread.id, session);
-    return session;
+  /** Connect a Discord thread to a native conversation, creating one only when omitted. */
+  attach(thread: ThreadChannel, conversation?: Conversation): Promise<DiscordConversation> {
+    if (thread.parentId !== this.config.channel_id || thread.guildId !== this.config.guild_id)
+      throw new Error("Thread is outside the configured Discord channel");
+    const existing = this.conversations.get(thread.id);
+    if (existing)
+      return existing.then((attached) => {
+        if (conversation && attached.conversation.id !== conversation.id)
+          throw new Error("Discord thread is already connected to another conversation");
+        return attached;
+      });
+    const bound = this.bindings.get(thread.id);
+    if (conversation && bound !== undefined && bound !== conversation.id)
+      throw new Error("Discord thread is already connected to another conversation");
+    const opening = (
+      conversation
+        ? Promise.resolve(conversation)
+        : bound !== undefined
+          ? this.bot.harness.conversation(bound, context)
+          : this.bot.harness.createConversation(
+              {
+                ownership: { kind: "ownerless" },
+                init: async (tx, id) => {
+                  (await tx.doc(DiscordConnection, id)).threadId = thread.id;
+                },
+              },
+              context,
+            )
+    )
+      .then(async (native) => {
+        if (!native) throw new Error(`Missing conversation for Discord thread ${thread.id}`);
+        const attached = await DiscordConversation.open(native, thread);
+        this.bindings.set(thread.id, native.id);
+        return attached;
+      })
+      .catch((error: unknown) => {
+        this.conversations.delete(thread.id);
+        throw error;
+      });
+    this.conversations.set(thread.id, opening);
+    return opening;
   }
 
   private allowed(message: Message): boolean {
@@ -178,11 +238,11 @@ export class Discord {
       message.guildId === this.config.guild_id &&
       this.config.allowed_user_ids.includes(message.author.id) &&
       (message.channelId === this.config.channel_id ||
-        this.sessionThread(message.channel) !== undefined)
+        this.configuredThread(message.channel) !== undefined)
     );
   }
 
-  private sessionThread(channel: Channel | null): ThreadChannel | undefined {
+  private configuredThread(channel: Channel | null): ThreadChannel | undefined {
     if (!channel?.isThread()) return undefined;
     return channel.parentId === this.config.channel_id && channel.guildId === this.config.guild_id
       ? channel
@@ -201,11 +261,9 @@ export class Discord {
     });
     const thread = message.channel.isThread() ? message.channel : await this.thread(message);
     try {
-      const conversation = await this.bot.conversation(this.name, thread.id);
-      const session = await this.attach(thread, conversation);
-      await session.submit(message);
+      await (await this.attach(thread)).submit(message);
     } catch (error) {
-      console.error(`Session ${thread.id} failed`, error);
+      console.error(`Discord thread ${thread.id} failed`, error);
       if (!this.stopping) await thread.send(responseOptions(errorText(error)));
     }
   }
@@ -228,22 +286,19 @@ export class Discord {
     }
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const thread = this.sessionThread(interaction.channel);
-      const conversation = thread
-        ? await this.bot.findConversation(this.name, thread.id)
-        : undefined;
-      if (!thread || !conversation) {
-        await interaction.editReply("Use this command in a managed session thread.");
+      const thread = this.configuredThread(interaction.channel);
+      const attached = thread ? await this.conversations.get(thread.id) : undefined;
+      if (!attached) {
+        await interaction.editReply("Use this command in a connected conversation thread.");
         return;
       }
-      const session = await this.attach(thread, conversation);
       switch (interaction.commandName) {
         case "stop":
-          await session.conversation.abort(context);
+          await attached.conversation.abort(context);
           await interaction.deleteReply();
           return;
         case "status":
-          await interaction.editReply({ embeds: [await session.status()] });
+          await interaction.editReply({ embeds: [await attached.status()] });
           return;
         default:
           await interaction.editReply("Unknown command.");
@@ -257,7 +312,9 @@ export class Discord {
   private async thread(message: Message): Promise<ThreadChannel> {
     if (message.thread) return message.thread;
     const thread = await message.startThread({
-      name: message.cleanContent.replace(/\s+/g, " ").slice(0, 100).toWellFormed() || "New session",
+      name:
+        message.cleanContent.replace(/\s+/g, " ").slice(0, 100).toWellFormed() ||
+        "New conversation",
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
     });
     log("discord.thread_created", { threadId: thread.id, messageId: message.id });
@@ -265,11 +322,19 @@ export class Discord {
   }
 }
 
-const DiscordMessage = defineEntry<{ id: string; author: string }>("vidhan-bot.message");
-const requestId = (id: string) => `discord:${id}`;
-type DeliveryState = { lastInput?: EntryId; message?: string };
-const Delivery = defineDoc<DeliveryState>({
-  kind: "vidhan-bot.discord-delivery",
+const DiscordMessage = defineEntry<string>("vidhan-bot.message.discord");
+const requestId = (id: string) => `${DiscordMessage.kind}:${id}`;
+const DiscordConnection = defineDoc<{ threadId?: string }>({
+  kind: "vidhan-bot.conversation.discord",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({}),
+});
+type DeliveryState = { lastHandledInput?: EntryId; pendingReplyId?: string };
+const DiscordDelivery = defineDoc<DeliveryState>({
+  kind: "vidhan-bot.delivery.discord",
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -277,45 +342,54 @@ const Delivery = defineDoc<DeliveryState>({
   initial: () => ({}),
 });
 
-export class DiscordSession {
+export class DiscordConversation {
   private closed = false;
+  private closing: Promise<void> | undefined;
   private incoming = Promise.resolve();
   private work = Promise.resolve();
+  private updatedAt = 0;
   private typing: ReturnType<typeof setInterval> | undefined;
-  private message: Message | undefined;
-  private rendered: ConversationView | undefined;
-  private lastRender = 0;
+  private message: { input: EntryId; value: Message } | undefined;
 
   private constructor(
     readonly conversation: Conversation,
     private readonly thread: ThreadChannel,
     private readonly view: AttachedReplicatedState<ConversationView>,
-    private delivery: DeliveryState,
+    private readonly delivery: DeliveryState,
   ) {
     view.subscribe(async () => {
       if (this.closed) return;
       this.setTyping(
         Boolean((view.value.docs[LiveDoc.definition.kind] as LiveState | undefined)?.run),
       );
-      if (this.rendered === view.value) return;
       this.work = this.refresh();
       await this.work;
     });
   }
 
-  static async open(conversation: Conversation, thread: ThreadChannel): Promise<DiscordSession> {
+  static async open(
+    conversation: Conversation,
+    thread: ThreadChannel,
+  ): Promise<DiscordConversation> {
     const delivery = await conversation.commit(async (tx) => {
-      const state = await tx.doc(Delivery, conversation.id);
-      return { ...state };
+      const connection = await tx.doc(DiscordConnection, conversation.id);
+      if (connection.threadId !== undefined && connection.threadId !== thread.id)
+        throw new Error("Conversation is already connected to another Discord thread");
+      connection.threadId = thread.id;
+      return { ...(await tx.doc(DiscordDelivery, conversation.id)) };
     }, context);
-    const view = await conversation.viewState(context);
-    return new DiscordSession(conversation, thread, view, delivery);
+    return new DiscordConversation(
+      conversation,
+      thread,
+      await conversation.viewState(context),
+      delivery,
+    );
   }
 
   /** Translate and admit messages in arrival order; pi queues the runs. */
   submit(message: Message): Promise<Submission> {
     const submission = this.incoming.then(async () => {
-      if (this.closed) throw new Error("Discord session is closed");
+      if (this.closed) throw new Error("Discord conversation is closed");
       const result = await this.conversation.submit(
         {
           type: "input",
@@ -323,7 +397,7 @@ export class DiscordSession {
           requestId: requestId(message.id),
           entry: {
             kind: DiscordMessage.kind,
-            data: { id: message.id, author: message.author.username },
+            data: message.id,
           },
         },
         context,
@@ -343,30 +417,31 @@ export class DiscordSession {
   }
 
   async status(): Promise<EmbedBuilder> {
-    return sessionEmbed(await this.conversation.agent(context), this.view.value);
+    return conversationEmbed(await this.conversation.agent(context), this.view.value);
   }
 
-  async close(): Promise<void> {
-    this.closed = true;
-    await this.incoming;
-    this.view.dispose();
-    this.setTyping(false);
-    await this.work;
-    await this.render(this.view.value);
+  close(): Promise<void> {
+    return (this.closing ??= (async () => {
+      this.closed = true;
+      await this.incoming;
+      this.view.dispose();
+      this.setTyping(false);
+      await this.work;
+      await this.render(this.view.value);
+    })());
   }
 
   private async refresh(): Promise<void> {
     while (!this.closed) {
       try {
-        await delay(Math.max(0, 750 - (Date.now() - this.lastRender)));
+        await delay(Math.max(0, 750 - (Date.now() - this.updatedAt)));
         if (this.closed) return;
-        const value = this.view.value;
-        await this.render(value);
-        this.rendered = value;
-        this.lastRender = Date.now();
+        await this.render(this.view.value);
+        this.updatedAt = Date.now();
         return;
       } catch (error) {
-        console.error("Discord session update failed", { threadId: this.thread.id, error });
+        console.error("Discord conversation update failed", { threadId: this.thread.id, error });
+        if (error instanceof SessionFailed) return;
         await delay(5000);
       }
     }
@@ -391,78 +466,92 @@ export class DiscordSession {
 
   private async render(view: ConversationView): Promise<void> {
     const query = {
-      ...(this.delivery.lastInput === undefined ? {} : { minEntryId: this.delivery.lastInput }),
+      ...(this.delivery.lastHandledInput === undefined
+        ? {}
+        : { minEntryId: this.delivery.lastHandledInput }),
       order: "ascending" as const,
     };
     let cursor: Cursor | undefined;
     do {
       const page = await this.conversation.entries(query, 100, cursor, context);
       for (const input of page.items) {
-        if (!DiscordMessage.is(input) || input.id === this.delivery.lastInput) continue;
-        const submission = await this.conversation.commit(
-          (tx) => tx.submissionByRequest(this.conversation.id, requestId(input.data.id)),
+        if (
+          !DiscordMessage.is(input) ||
+          (this.delivery.lastHandledInput !== undefined &&
+            input.id <= this.delivery.lastHandledInput)
+        )
+          continue;
+        const result = await this.conversation.commit(
+          (tx) => tx.submissionByRequest(this.conversation.id, requestId(input.data)),
           context,
         );
-        if (!submission || submission.type !== "input")
-          throw new Error(`Missing Discord submission for message ${input.data.id}`);
-        if (submission.status === "placed" || submission.status === "queued") {
-          const content = renderToolLog(view, input.id);
-          if (content) await this.reply(input.id, content);
+        if (!result || result.type !== "input")
+          throw new Error(`Missing Discord input ${input.data}`);
+        if (result.status === "placed" || result.status === "queued") {
+          const text = renderToolLog(view, input.id);
+          if (text) await this.reply(input.id, text);
           return;
         }
-        if (submission.status === "done") {
+        if (result.status === "done") {
           const answer = await this.conversation.commit(
-            (tx) => tx.entry(AssistantEntry, submission.answer),
+            (tx) => tx.entry(AssistantEntry, result.answer),
             context,
           );
-          if (!answer) throw new Error(`Missing answer for message ${input.data.id}`);
+          if (!answer) throw new Error(`Missing answer for Discord input ${input.data}`);
           const text = answer.model
             ?.flatMap((message) =>
-              message.role === "assistant"
-                ? message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
-                : [],
+              message.role === "assistant" ? [contentText(message.content)] : [],
             )
             .join("\n");
           await this.reply(input.id, text || "Completed with no text response.");
-        } else if (submission.reason === "aborted") {
-          const message = await this.currentMessage();
+        } else if (result.reason === "aborted") {
+          const message = await this.currentMessage(input.id);
           if (message)
             await message.delete().catch((error: unknown) => {
               if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
             });
         } else {
-          await this.reply(input.id, `Session ended without an answer: ${submission.reason}.`);
+          await this.reply(input.id, `Conversation ended without an answer: ${result.reason}.`);
         }
-        await this.checkpoint({ lastInput: input.id });
+        await this.conversation.commit(async (tx) => {
+          const delivery = await tx.doc(DiscordDelivery, this.conversation.id);
+          delivery.lastHandledInput = input.id;
+          delete delivery.pendingReplyId;
+        }, context);
+        this.delivery.lastHandledInput = input.id;
+        delete this.delivery.pendingReplyId;
         this.message = undefined;
         log("discord.response_delivered", {
-          threadId: this.thread.id,
-          messageId: input.data.id,
-          status: submission.status,
+          conversationId: this.conversation.id,
+          messageId: input.data,
+          status: result.status,
         });
       }
       cursor = page.next;
     } while (cursor);
   }
 
-  private async currentMessage(): Promise<Message | undefined> {
-    if (this.message || !this.delivery.message) return this.message;
+  private async currentMessage(input: EntryId): Promise<Message | undefined> {
+    if (this.message?.input === input) return this.message.value;
+    this.message = undefined;
+    const id = this.delivery.pendingReplyId;
+    if (id === undefined) return undefined;
     try {
-      this.message = await this.thread.messages.fetch(this.delivery.message);
+      this.message = { input, value: await this.thread.messages.fetch(id) };
     } catch (error) {
       if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
       await this.clearMessage();
     }
-    return this.message;
+    return this.message?.value;
   }
 
   private async reply(input: EntryId, text: string): Promise<void> {
     if (this.thread.archived) await this.thread.setArchived(false);
-    const message = await this.currentMessage();
+    const message = await this.currentMessage(input);
     if (message) {
       try {
         if (message.content !== text || message.attachments.size > 0)
-          this.message = await message.edit(responseOptions(text));
+          this.message = { input, value: await message.edit(responseOptions(text)) };
         return;
       } catch (error) {
         if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
@@ -473,25 +562,20 @@ export class DiscordSession {
       .update(`${this.conversation.id}:${input}`)
       .digest("hex")
       .slice(0, 24);
-    this.message = await this.thread.send({ ...responseOptions(text), nonce, enforceNonce: true });
-    await this.checkpoint({ ...this.delivery, message: this.message.id });
+    const sent = await this.thread.send({ ...responseOptions(text), nonce, enforceNonce: true });
+    this.message = { input, value: sent };
+    await this.conversation.commit(async (tx) => {
+      (await tx.doc(DiscordDelivery, this.conversation.id)).pendingReplyId = sent.id;
+    }, context);
+    this.delivery.pendingReplyId = sent.id;
   }
 
   private async clearMessage(): Promise<void> {
     this.message = undefined;
-    const { message: _message, ...state } = this.delivery;
-    await this.checkpoint(state);
-  }
-
-  private async checkpoint(state: DeliveryState): Promise<void> {
     await this.conversation.commit(async (tx) => {
-      const doc = await tx.doc(Delivery, this.conversation.id);
-      if (state.lastInput === undefined) delete doc.lastInput;
-      else doc.lastInput = state.lastInput;
-      if (state.message === undefined) delete doc.message;
-      else doc.message = state.message;
+      delete (await tx.doc(DiscordDelivery, this.conversation.id)).pendingReplyId;
     }, context);
-    this.delivery = state;
+    delete this.delivery.pendingReplyId;
   }
 }
 
@@ -573,10 +657,7 @@ function renderToolLog(view: ConversationView, input: EntryId): string {
   const outputs = recent.map((call) => {
     const slot = live?.tools?.find((tool) => tool.callId === call.id);
     const result = results.get(call.id);
-    const output =
-      slot?.output ??
-      result?.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n") ??
-      "";
+    const output = slot?.output ?? (result ? contentText(result.content) : undefined) ?? "";
     return codeText(toolOutput(call.name, output, slot?.details ?? result?.details));
   });
   const active = outputs.filter(Boolean).length;
@@ -593,7 +674,7 @@ function renderToolLog(view: ConversationView, input: EntryId): string {
     .join("\n");
 }
 
-function sessionEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
+function conversationEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
   const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
   const usage = view.docs[UsageDoc.definition.kind] as UsageState | undefined;
   const running = live?.tools?.findLast((tool) => tool.status === "running");
@@ -615,7 +696,7 @@ function sessionEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
     }
   return new EmbedBuilder()
     .setColor(Colors.Blurple)
-    .setTitle("Session status")
+    .setTitle("Conversation status")
     .addFields(
       { name: "Status", value: activity, inline: true },
       {
@@ -634,9 +715,7 @@ function sessionEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
 }
 
 async function messageContent(message: Message): Promise<UserInput> {
-  const content: (TextContent | ImageContent)[] = [
-    { type: "text", text: `${message.author.username}: ${message.content.trim()}` },
-  ];
+  const content: (TextContent | ImageContent)[] = [{ type: "text", text: message.content.trim() }];
   let imageBytes = 0;
   let imageCount = 0;
   for (const item of message.attachments.values()) {

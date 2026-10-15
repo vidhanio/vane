@@ -28,7 +28,6 @@ export const botConfigSchema = z.strictObject({
     model_id: z.string().min(1),
     thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).default("medium"),
     cwd: pathSchema.default("/tmp"),
-    instructions: z.string().default(""),
   }),
 });
 export type BotConfig = z.infer<typeof botConfigSchema>;

@@ -6,4 +6,4 @@ export {
   validateBotConfig,
   type BotConfig,
 } from "./config.ts";
-export { Discord, DiscordSession } from "./platforms/discord.ts";
+export { Discord, DiscordConversation } from "./platforms/discord.ts";
