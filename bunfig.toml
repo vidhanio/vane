@@ -1,0 +1,30 @@
+[fmt]
+printWidth = 100
+tabWidth = 2
+ignorePatterns = [
+  "node_modules",
+  "dist",
+  "result",
+  ".direnv",
+  "bun.lock",
+  "nix/bun.nix",
+  "flake.lock",
+  "README.md",
+  "config.toml",
+]
+
+[lint]
+ignorePatterns = ["node_modules", "dist", "result", ".direnv"]
+
+[lint.categories]
+correctness = "error"
+suspicious = "warn"
+
+[lint.rules]
+"@typescript-eslint/no-explicit-any" = "error"
+"@typescript-eslint/no-non-null-assertion" = "error"
+"@typescript-eslint/consistent-type-imports" = "error"
+"import/no-cycle" = "error"
+"promise/always-return" = "off"
+"@typescript-eslint/no-unsafe-type-assertion" = "off"
+eqeqeq = "error"

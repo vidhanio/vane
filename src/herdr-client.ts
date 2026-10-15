@@ -16,8 +16,10 @@ interface Methods {
     timeout_ms: number;
   };
   "agent.prompt": { target: string; text: string; wait: { timeout_ms: number } };
-  "agent.wait": { target: string; timeout_ms: number };
+  "workspace.list": Record<string, never>;
   "workspace.create": { cwd: string; label: string; focus: false };
+  "pane.list": { workspace_id: string };
+  "tab.create": { workspace_id: string; cwd: string; label: string; focus: false };
 }
 
 export class HerdrError extends Error {
@@ -29,6 +31,7 @@ export class HerdrError extends Error {
   }
 }
 
+/** Targets the Herdr v0.9.5 socket API. */
 export class HerdrClient {
   constructor(readonly socketPath: string) {}
 
@@ -81,40 +84,5 @@ export class HerdrClient {
     for await (const frame of this.exchange(method, params, context, timeout))
       return z.object({ id: z.string(), result: z.unknown() }).parse(frame).result;
     throw new Error("Herdr did not respond");
-  }
-
-  async *watchAgent(paneId: string, context: Context, timeout = 35_000) {
-    const subscriptions = [
-      { type: "pane.agent_status_changed", pane_id: paneId },
-      { type: "pane.scroll_changed", pane_id: paneId },
-      { type: "pane.updated" },
-      { type: "pane.agent_detected" },
-      { type: "pane.exited" },
-      { type: "pane.closed" },
-    ];
-    let started = false;
-    for await (const frame of this.exchange(
-      "events.subscribe",
-      { subscriptions },
-      context,
-      timeout,
-    )) {
-      if (!started) {
-        z.object({ result: z.object({ type: z.literal("subscription_started") }) }).parse(frame);
-        started = true;
-        yield;
-      } else {
-        const event = z
-          .object({
-            event: z.string(),
-            data: z.object({
-              pane_id: z.string().optional(),
-              pane: z.object({ pane_id: z.string() }).optional(),
-            }),
-          })
-          .parse(frame);
-        if ((event.data.pane_id ?? event.data.pane?.pane_id) === paneId) yield;
-      }
-    }
   }
 }

@@ -9,7 +9,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default-linux";
     bun2nix = {
-      url = "github:Mic92/bun2nix/0456acb1b7394fc14c414b056aa889df5124943a";
+      url = "github:Mic92/bun2nix/lockfile-v2-v3";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.systems.follows = "systems";
     };
@@ -36,24 +36,68 @@
         {
           _module.args.pkgs = import inputs.nixpkgs {
             inherit system;
-            overlays = [ inputs.bun2nix.overlays.default ];
+            overlays = [
+              inputs.bun2nix.overlays.default
+              (final: prev: {
+                bun = prev.bun.overrideAttrs {
+                  version = "1.4.4-canary-5f5799e";
+                  src = final.fetchurl {
+                    url = "https://github.com/oven-sh/bun/releases/download/canary/bun-${
+                      {
+                        x86_64-linux = "linux-x64-baseline";
+                        aarch64-linux = "linux-aarch64";
+                        aarch64-darwin = "darwin-aarch64";
+                      }
+                      .${system}
+                    }.zip";
+                    hash =
+                      {
+                        x86_64-linux = "sha256-gK+A7VaGAPTKZbRKD/twJYaXOh8O/gZy1WK+QB8pVig=";
+                        aarch64-linux = "sha256-FUtFYaqZzUqP3nBjV5G3pxEykw0jdXX4MIkVqySeHLA=";
+                        aarch64-darwin = "sha256-LL40rGK6r5ezk13YJkgJRw8/fQqNm9atRwdimHjRdUE=";
+                      }
+                      .${system};
+                  };
+                };
+              })
+            ];
           };
           packages.default = pkgs.callPackage ./nix/package.nix { };
-          apps.default = {
-            type = "app";
-            program = pkgs.lib.getExe config.packages.default;
-          };
           checks.vidhan-bot = config.packages.default;
-          treefmt = import ./nix/treefmt.nix { };
+          treefmt = {
+            projectRootFile = "flake.nix";
+            settings.formatter.bun = {
+              command = "${pkgs.bun}/bin/bun";
+              options = [ "fmt" ];
+              includes = [
+                "*.ts"
+                "*.json"
+                "*.yml"
+                "*.yaml"
+                "*.md"
+              ];
+              excludes = [
+                "README.md"
+                "bun.lock"
+                "flake.lock"
+              ];
+            };
+            programs.nixfmt.enable = true;
+            programs.taplo.enable = true;
+            settings.global.excludes = [
+              "nix/bun.nix"
+              "node_modules/**"
+              "dist/**"
+              ".direnv/**"
+              "result/**"
+            ];
+          };
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.bun
               pkgs.bun2nix
-              pkgs.oxfmt
-              pkgs.oxlint
               pkgs.git
               pkgs.direnv
-              pkgs.herdr
               config.treefmt.build.wrapper
             ];
             shellHook = ''

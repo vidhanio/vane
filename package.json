@@ -9,11 +9,11 @@
   "scripts": {
     "start": "bun run src/cli.ts",
     "build": "bun build src/cli.ts --target=bun --packages=external --outdir=dist",
-    "check": "tsc --noEmit",
-    "fmt": "oxfmt .",
-    "fmt:check": "oxfmt --check .",
-    "lint": "oxlint --deny-warnings src",
-    "lint:fix": "oxlint --fix src"
+    "check": "bun check",
+    "fmt": "bun fmt",
+    "fmt:check": "bun fmt --check .",
+    "lint": "bun lint --max-warnings 0 src",
+    "lint:fix": "bun lint --fix src"
   },
   "dependencies": {
     "@earendil-works/chord": "1.2.0",
@@ -27,9 +27,6 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.3",
-    "@types/proper-lockfile": "^4.1.4",
-    "oxfmt": "0.73.0",
-    "oxlint": "1.88.0",
-    "typescript": "^7.0.2"
+    "@types/proper-lockfile": "^4.1.4"
   }
 }

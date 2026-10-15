@@ -6,7 +6,6 @@ import {
   type JsonObject,
   type TextContent,
   type ToolCall,
-  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
@@ -34,17 +33,19 @@ import {
   Colors,
   DiscordAPIError,
   EmbedBuilder,
-  escapeMarkdown,
   Events,
   GatewayIntentBits,
   InteractionContextType,
   MessageFlags,
+  Partials,
   SlashCommandBuilder,
   ThreadAutoArchiveDuration,
   type Attachment as DiscordAttachment,
   type Channel,
   type ChatInputCommandInteraction,
   type Message,
+  type DMChannel,
+  type PartialDMChannel,
   type TextChannel,
   type ThreadChannel,
 } from "discord.js";
@@ -53,7 +54,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Bot } from "../bot.ts";
-import { herdrProgressSchema } from "../herdr.ts";
 import { log } from "../log.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -66,15 +66,22 @@ const configSchema = z.strictObject({
 });
 type DiscordConfig = z.infer<typeof configSchema>;
 
+type DiscordThread = ThreadChannel | DMChannel | PartialDMChannel;
+const threadKey = (thread: DiscordThread) => (thread.type === ChannelType.DM ? "dm" : thread.id);
+
 const commands = [
   new SlashCommandBuilder()
     .setName("stop")
     .setDescription("Stop the response running in this conversation")
-    .setContexts(InteractionContextType.Guild),
+    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
   new SlashCommandBuilder()
     .setName("status")
     .setDescription("Show this conversation's activity, model and usage")
-    .setContexts(InteractionContextType.Guild),
+    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
+  new SlashCommandBuilder()
+    .setName("reset")
+    .setDescription("Reset this conversation to a fresh context")
+    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
 ];
 
 export class Discord {
@@ -83,8 +90,10 @@ export class Discord {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
       GatewayIntentBits.MessageContent,
     ],
+    partials: [Partials.Channel],
     allowedMentions: { parse: [], repliedUser: false },
   });
   private readonly config: DiscordConfig;
@@ -118,14 +127,22 @@ export class Discord {
     await this.client.login(this.config.token);
     await ready;
     const guild = await this.client.guilds.fetch(this.config.guild_id);
-    await guild.commands
-      .set(commands.map((command) => command.toJSON()))
-      .catch((error: unknown) => {
-        throw new Error(
-          "Could not register application commands; the bot needs the applications.commands scope.",
-          { cause: error },
-        );
-      });
+    const application = this.client.application;
+    if (!application) throw new Error("Discord application is unavailable");
+    await Promise.all([
+      guild.commands.set(commands.map((command) => command.toJSON())),
+      application.commands.set(
+        commands.map((command) => ({
+          ...command.toJSON(),
+          contexts: [InteractionContextType.BotDM],
+        })),
+      ),
+    ]).catch((error: unknown) => {
+      throw new Error(
+        "Could not register application commands; the bot needs the applications.commands scope.",
+        { cause: error },
+      );
+    });
     const channel = await this.client.channels.fetch(this.config.channel_id);
     if (channel?.type !== ChannelType.GuildText || channel.guildId !== this.config.guild_id)
       throw new Error("discord channel_id must be a text channel in discord guild_id");
@@ -162,7 +179,7 @@ export class Discord {
       for (const record of page.items) {
         const connection = await this.bot.harness.snapshot(DiscordConnection, record.id, context);
         if (!connection?.threadId) continue;
-        this.bindings.set(connection.threadId, record.id);
+        this.bindings.set(connection.dm ? "dm" : connection.threadId, record.id);
         try {
           const thread = this.configuredThread(
             await this.client.channels.fetch(connection.threadId),
@@ -190,17 +207,21 @@ export class Discord {
   }
 
   /** Connect a Discord thread to a native conversation, creating one only when omitted. */
-  attach(thread: ThreadChannel, conversation?: Conversation): Promise<DiscordConversation> {
-    if (thread.parentId !== this.config.channel_id || thread.guildId !== this.config.guild_id)
+  attach(thread: DiscordThread, conversation?: Conversation): Promise<DiscordConversation> {
+    if (
+      thread.type !== ChannelType.DM &&
+      (thread.parentId !== this.config.channel_id || thread.guildId !== this.config.guild_id)
+    )
       throw new Error("Thread is outside the configured Discord channel");
-    const existing = this.conversations.get(thread.id);
+    const key = threadKey(thread);
+    const existing = this.conversations.get(key);
     if (existing)
       return existing.then((attached) => {
         if (conversation && attached.conversation.id !== conversation.id)
           throw new Error("Discord thread is already connected to another conversation");
         return attached;
       });
-    const bound = this.bindings.get(thread.id);
+    const bound = this.bindings.get(key);
     if (conversation && bound !== undefined && bound !== conversation.id)
       throw new Error("Discord thread is already connected to another conversation");
     const opening = (
@@ -212,7 +233,9 @@ export class Discord {
               {
                 ownership: { kind: "ownerless" },
                 init: async (tx, id) => {
-                  (await tx.doc(DiscordConnection, id)).threadId = thread.id;
+                  const connection = await tx.doc(DiscordConnection, id);
+                  connection.threadId = thread.id;
+                  connection.dm = thread.type === ChannelType.DM;
                 },
               },
               context,
@@ -221,28 +244,28 @@ export class Discord {
       .then(async (native) => {
         if (!native) throw new Error(`Missing conversation for Discord thread ${thread.id}`);
         const attached = await DiscordConversation.open(native, thread);
-        this.bindings.set(thread.id, native.id);
+        this.bindings.set(key, native.id);
         return attached;
       })
       .catch((error: unknown) => {
-        this.conversations.delete(thread.id);
+        this.conversations.delete(key);
         throw error;
       });
-    this.conversations.set(thread.id, opening);
+    this.conversations.set(key, opening);
     return opening;
   }
 
   private allowed(message: Message): boolean {
     return (
       !message.author.bot &&
-      message.guildId === this.config.guild_id &&
       this.config.allowed_user_ids.includes(message.author.id) &&
-      (message.channelId === this.config.channel_id ||
+      ((message.guildId === this.config.guild_id && message.channelId === this.config.channel_id) ||
         this.configuredThread(message.channel) !== undefined)
     );
   }
 
-  private configuredThread(channel: Channel | null): ThreadChannel | undefined {
+  private configuredThread(channel: Channel | null): DiscordThread | undefined {
+    if (channel?.type === ChannelType.DM) return channel;
     if (!channel?.isThread()) return undefined;
     return channel.parentId === this.config.channel_id && channel.guildId === this.config.guild_id
       ? channel
@@ -259,7 +282,7 @@ export class Discord {
       textLength: content.length,
       attachments: message.attachments.size,
     });
-    const thread = message.channel.isThread() ? message.channel : await this.thread(message);
+    const thread = this.configuredThread(message.channel) ?? (await this.thread(message));
     try {
       await (await this.attach(thread)).submit(message);
     } catch (error) {
@@ -275,7 +298,7 @@ export class Discord {
       channelId: interaction.channelId,
     });
     if (
-      interaction.guildId !== this.config.guild_id ||
+      (interaction.guildId !== null && interaction.guildId !== this.config.guild_id) ||
       !this.config.allowed_user_ids.includes(interaction.user.id)
     ) {
       await interaction.reply({
@@ -287,7 +310,12 @@ export class Discord {
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const thread = this.configuredThread(interaction.channel);
-      const attached = thread ? await this.conversations.get(thread.id) : undefined;
+      const attached =
+        thread?.type === ChannelType.DM
+          ? await this.attach(thread)
+          : thread
+            ? await this.conversations.get(threadKey(thread))
+            : undefined;
       if (!attached) {
         await interaction.editReply("Use this command in a connected conversation thread.");
         return;
@@ -296,6 +324,10 @@ export class Discord {
         case "stop":
           await attached.conversation.abort(context);
           await interaction.deleteReply();
+          return;
+        case "reset":
+          await attached.reset();
+          await interaction.editReply("Conversation reset.");
           return;
         case "status":
           await interaction.editReply({ embeds: [await attached.status()] });
@@ -323,8 +355,11 @@ export class Discord {
 }
 
 const DiscordMessage = defineEntry<string>("vidhan-bot.message.discord");
+const DiscordDMMessage = defineEntry<{ messageId: string; channelId: string }>(
+  "vidhan-bot.message.discord.dm",
+);
 const requestId = (id: string) => `${DiscordMessage.kind}:${id}`;
-const DiscordConnection = defineDoc<{ threadId?: string }>({
+const DiscordConnection = defineDoc<{ threadId?: string; dm?: boolean }>({
   kind: "vidhan-bot.conversation.discord",
   version: 1,
   scope: "conversation",
@@ -349,14 +384,16 @@ export class DiscordConversation {
   private work = Promise.resolve();
   private updatedAt = 0;
   private typing: ReturnType<typeof setInterval> | undefined;
+  private typingThread: DiscordThread;
   private message: { input: EntryId; value: Message } | undefined;
 
   private constructor(
     readonly conversation: Conversation,
-    private readonly thread: ThreadChannel,
+    private readonly thread: DiscordThread,
     private readonly view: AttachedReplicatedState<ConversationView>,
     private readonly delivery: DeliveryState,
   ) {
+    this.typingThread = thread;
     view.subscribe(async () => {
       if (this.closed) return;
       this.setTyping(
@@ -369,13 +406,17 @@ export class DiscordConversation {
 
   static async open(
     conversation: Conversation,
-    thread: ThreadChannel,
+    thread: DiscordThread,
   ): Promise<DiscordConversation> {
     const delivery = await conversation.commit(async (tx) => {
       const connection = await tx.doc(DiscordConnection, conversation.id);
-      if (connection.threadId !== undefined && connection.threadId !== thread.id)
+      if (
+        connection.threadId !== undefined &&
+        (connection.dm ? thread.type !== ChannelType.DM : connection.threadId !== thread.id)
+      )
         throw new Error("Conversation is already connected to another Discord thread");
       connection.threadId = thread.id;
+      connection.dm = thread.type === ChannelType.DM;
       return { ...(await tx.doc(DiscordDelivery, conversation.id)) };
     }, context);
     return new DiscordConversation(
@@ -395,10 +436,13 @@ export class DiscordConversation {
           type: "input",
           content: await messageContent(message),
           requestId: requestId(message.id),
-          entry: {
-            kind: DiscordMessage.kind,
-            data: message.id,
-          },
+          entry:
+            message.channel.type === ChannelType.DM
+              ? {
+                  kind: DiscordDMMessage.kind,
+                  data: { messageId: message.id, channelId: message.channelId },
+                }
+              : { kind: DiscordMessage.kind, data: message.id },
         },
         context,
       );
@@ -414,6 +458,12 @@ export class DiscordConversation {
       () => undefined,
     );
     return submission;
+  }
+
+  reset(): Promise<void> {
+    const reset = this.incoming.then(() => this.conversation.reset(undefined, context));
+    this.incoming = reset.catch(() => undefined);
+    return reset;
   }
 
   async status(): Promise<EmbedBuilder> {
@@ -453,7 +503,7 @@ export class DiscordConversation {
       this.typing = undefined;
     } else if (this.typing === undefined && !this.closed) {
       const ping = () => {
-        void this.thread
+        void this.typingThread
           .sendTyping()
           .catch((error: unknown) =>
             console.error("Discord typing failed", { threadId: this.thread.id, error }),
@@ -476,20 +526,27 @@ export class DiscordConversation {
       const page = await this.conversation.entries(query, 100, cursor, context);
       for (const input of page.items) {
         if (
-          !DiscordMessage.is(input) ||
+          (!DiscordMessage.is(input) && !DiscordDMMessage.is(input)) ||
           (this.delivery.lastHandledInput !== undefined &&
             input.id <= this.delivery.lastHandledInput)
         )
           continue;
+        const messageId = DiscordDMMessage.is(input) ? input.data.messageId : input.data;
+        const thread = DiscordDMMessage.is(input)
+          ? await this.thread.client.channels.fetch(input.data.channelId)
+          : this.thread;
+        if (!thread || (thread.type !== ChannelType.DM && !thread.isThread()))
+          throw new Error(`Missing Discord channel for input ${messageId}`);
         const result = await this.conversation.commit(
-          (tx) => tx.submissionByRequest(this.conversation.id, requestId(input.data)),
+          (tx) => tx.submissionByRequest(this.conversation.id, requestId(messageId)),
           context,
         );
         if (!result || result.type !== "input")
-          throw new Error(`Missing Discord input ${input.data}`);
+          throw new Error(`Missing Discord input ${messageId}`);
         if (result.status === "placed" || result.status === "queued") {
+          this.typingThread = thread;
           const text = renderToolLog(view, input.id);
-          if (text) await this.reply(input.id, text);
+          if (text) await this.reply(input.id, text, thread);
           return;
         }
         if (result.status === "done") {
@@ -497,21 +554,25 @@ export class DiscordConversation {
             (tx) => tx.entry(AssistantEntry, result.answer),
             context,
           );
-          if (!answer) throw new Error(`Missing answer for Discord input ${input.data}`);
+          if (!answer) throw new Error(`Missing answer for Discord input ${messageId}`);
           const text = answer.model
             ?.flatMap((message) =>
               message.role === "assistant" ? [contentText(message.content)] : [],
             )
             .join("\n");
-          await this.reply(input.id, text || "Completed with no text response.");
+          await this.reply(input.id, text || "Completed with no text response.", thread);
         } else if (result.reason === "aborted") {
-          const message = await this.currentMessage(input.id);
+          const message = await this.currentMessage(input.id, thread);
           if (message)
             await message.delete().catch((error: unknown) => {
               if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
             });
         } else {
-          await this.reply(input.id, `Conversation ended without an answer: ${result.reason}.`);
+          await this.reply(
+            input.id,
+            `Conversation ended without an answer: ${result.reason}.`,
+            thread,
+          );
         }
         await this.conversation.commit(async (tx) => {
           const delivery = await tx.doc(DiscordDelivery, this.conversation.id);
@@ -523,7 +584,7 @@ export class DiscordConversation {
         this.message = undefined;
         log("discord.response_delivered", {
           conversationId: this.conversation.id,
-          messageId: input.data,
+          messageId,
           status: result.status,
         });
       }
@@ -531,13 +592,16 @@ export class DiscordConversation {
     } while (cursor);
   }
 
-  private async currentMessage(input: EntryId): Promise<Message | undefined> {
+  private async currentMessage(
+    input: EntryId,
+    thread: DiscordThread,
+  ): Promise<Message | undefined> {
     if (this.message?.input === input) return this.message.value;
     this.message = undefined;
     const id = this.delivery.pendingReplyId;
     if (id === undefined) return undefined;
     try {
-      this.message = { input, value: await this.thread.messages.fetch(id) };
+      this.message = { input, value: await thread.messages.fetch(id) };
     } catch (error) {
       if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
       await this.clearMessage();
@@ -545,9 +609,9 @@ export class DiscordConversation {
     return this.message?.value;
   }
 
-  private async reply(input: EntryId, text: string): Promise<void> {
-    if (this.thread.archived) await this.thread.setArchived(false);
-    const message = await this.currentMessage(input);
+  private async reply(input: EntryId, text: string, thread: DiscordThread): Promise<void> {
+    if (thread.isThread() && thread.archived) await thread.setArchived(false);
+    const message = await this.currentMessage(input, thread);
     if (message) {
       try {
         if (message.content !== text || message.attachments.size > 0)
@@ -562,7 +626,7 @@ export class DiscordConversation {
       .update(`${this.conversation.id}:${input}`)
       .digest("hex")
       .slice(0, 24);
-    const sent = await this.thread.send({ ...responseOptions(text), nonce, enforceNonce: true });
+    const sent = await thread.send({ ...responseOptions(text), nonce, enforceNonce: true });
     this.message = { input, value: sent };
     await this.conversation.commit(async (tx) => {
       (await tx.doc(DiscordDelivery, this.conversation.id)).pendingReplyId = sent.id;
@@ -603,73 +667,41 @@ function errorText(error: unknown): string {
 }
 
 function detailText(name: string, args: JsonObject): string {
-  if (name === "bash")
-    return String(args.command ?? "")
-      .replace(/\s+/g, " ")
-      .slice(0, 50);
-  if (name === "read" || name === "write" || name === "edit") return String(args.path ?? "");
-  if (name === "herdr") return [args.action, args.agent ?? args.name].filter(Boolean).join(" ");
+  if (name === "bash") return typeof args.command === "string" ? args.command : "";
+  if (name === "read" || name === "write" || name === "edit")
+    return typeof args.path === "string" ? args.path : "";
+  if (name.startsWith("herdr_")) {
+    const target = args.agent ?? args.name;
+    return typeof target === "string" ? target : "";
+  }
   return "";
-}
-
-function toolOutput(name: string, output: string, details: unknown): string {
-  if (name === "bash") return output;
-  if (name !== "herdr") return "";
-  const parsed = herdrProgressSchema.safeParse(details);
-  if (!parsed.success) return output;
-  const { agents, report, truncated, note } = parsed.data;
-  const rows = agents.map((agent) =>
-    [
-      agent.name,
-      agent.pane_id,
-      agent.agent_status,
-      agent.agent,
-      agent.title ?? agent.terminal_title_stripped,
-      agent.cwd,
-    ]
-      .filter(Boolean)
-      .join(" · "),
-  );
-  if (report) rows.push(report.split("\n").slice(-6).join("\n"));
-  if (truncated) rows.push("… output truncated");
-  if (note) rows.push(note);
-  return rows.join("\n");
 }
 
 function renderToolLog(view: ConversationView, input: EntryId): string {
   const calls: ToolCall[] = [];
-  const results = new Map<string, ToolResultMessage>();
   for (const entry of view.entries) {
     if (entry.id < input) continue;
     for (const message of entry.model ?? []) {
-      if (message.role === "toolResult") results.set(message.toolCallId, message);
       if (message.role === "assistant")
         for (const block of message.content) if (block.type === "toolCall") calls.push(block);
     }
   }
-  const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
-  const recent = calls.slice(-5);
-  const headers = recent.map((call) => {
-    const detail = detailText(call.name, call.arguments);
-    const label = `${call.name}${detail ? ` — ${detail}` : ""}`.replace(/\s+/g, " ");
-    return `*${escapeMarkdown(label.slice(0, 140).toWellFormed())}*`;
-  });
-  const outputs = recent.map((call) => {
-    const slot = live?.tools?.find((tool) => tool.callId === call.id);
-    const result = results.get(call.id);
-    const output = slot?.output ?? (result ? contentText(result.content) : undefined) ?? "";
-    return codeText(toolOutput(call.name, output, slot?.details ?? result?.details));
-  });
-  const active = outputs.filter(Boolean).length;
-  const budget = Math.max(0, messageLimit - headers.join("\n").length - active * 10);
-  const perCall = active ? Math.min(600, Math.floor(budget / active)) : 0;
-  return headers
-    .map((header, index) => {
-      const output = outputs[index];
-      if (!output || perCall < 20) return header;
-      const lines = output.split("\n").slice(-10).join("\n");
-      const tail = lines.length > perCall ? `…${lines.slice(-(perCall - 1))}` : lines;
-      return `${header}\n${codeBlock(tail.toWellFormed())}`;
+  return calls
+    .slice(-10)
+    .map((call) => {
+      const name = call.name.replaceAll("`", "").replace(/\s+/g, " ").slice(0, 140).toWellFormed();
+      const args = detailText(call.name, call.arguments)
+        .replaceAll("`", "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const limit = Math.max(
+        0,
+        Math.min(call.name === "bash" ? 50 : Infinity, 140 - name.length - 1),
+      );
+      const detail = (
+        args.length > limit ? `${args.slice(0, Math.max(0, limit - 1)).trimEnd()}…` : args
+      ).toWellFormed();
+      return `-# **\`${name}\`**${detail ? ` \`${detail}\`` : ""}`;
     })
     .join("\n");
 }
