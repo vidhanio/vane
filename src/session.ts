@@ -107,6 +107,7 @@ export class Session {
         {
           type: "input",
           content: input,
+          whenBusy: "steer",
           requestId: requestId(origin),
           entry: { kind: DirectMessage.kind, data: origin },
         },

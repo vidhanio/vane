@@ -102,19 +102,41 @@ async function report(client: HerdrClient, agent: Agent, context: Context) {
   }
 }
 
+async function launch(client: HerdrClient, paneId: string, name: string, context: Context) {
+  const deadline = Date.now() + 30_000;
+  let backoff = 100;
+  while (Date.now() < deadline) {
+    context.abortSignal?.throwIfAborted();
+    try {
+      return agentResult.parse(
+        await client.request(
+          "agent.start",
+          {
+            name,
+            kind: "pi",
+            pane_id: paneId,
+            timeout_ms: 30_000,
+          },
+          context,
+        ),
+      ).agent;
+    } catch (error) {
+      context.abortSignal?.throwIfAborted();
+      if (!(error instanceof HerdrError) || error.code !== "agent_pane_busy") throw error;
+    }
+    await delay(Math.min(backoff, Math.max(0, deadline - Date.now())), undefined, {
+      signal: context.abortSignal,
+    });
+    backoff = Math.min(backoff * 2, 1000);
+  }
+  throw new HerdrError(
+    "shell_not_ready",
+    `Pane ${paneId} did not become an available interactive shell within 30 seconds; no agent launch was accepted`,
+  );
+}
+
 async function start(client: HerdrClient, paneId: string, name: string, context: Context) {
-  const launched = agentResult.parse(
-    await client.request(
-      "agent.start",
-      {
-        name,
-        kind: "pi",
-        pane_id: paneId,
-        timeout_ms: 30_000,
-      },
-      context,
-    ),
-  ).agent;
+  const launched = await launch(client, paneId, name, context);
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const current = await get(client, paneId, context, Math.max(1, deadline - Date.now()));

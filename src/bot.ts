@@ -56,7 +56,7 @@ export class Bot {
           models,
           registry,
           env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? config.agent.cwd }),
-          settings: { toolExecution: "parallel" },
+          settings: { toolExecution: "parallel", steeringMode: "all" },
           onReport: (error) => console.error("Agent error", error),
         },
         context,

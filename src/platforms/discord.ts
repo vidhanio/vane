@@ -33,7 +33,7 @@ import type { Bot } from "../bot.ts";
 import { log } from "../log.ts";
 import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../session.ts";
 import { messageContent } from "./discord-content.ts";
-import { splitMessages } from "./discord-text.ts";
+import { splitMessages, windowMessage } from "./discord-text.ts";
 
 const context = BACKGROUND_CONTEXT;
 const configSchema = z.strictObject({
@@ -141,7 +141,8 @@ export class Discord implements DirectMessageIntegration {
     key: string,
   ): Promise<string[]> {
     const channel = await this.channel(origin.channelId);
-    const parts = splitMessages(calls.map(toolText).join("\n"));
+    const window = windowMessage(calls.map(toolText));
+    const parts = window ? [window] : [];
     const updated: string[] = [];
     for (const [index, content] of parts.entries()) {
       const id = ids[index];
