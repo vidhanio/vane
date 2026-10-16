@@ -444,7 +444,7 @@ export function herdrIntegration(config: BotConfig) {
       defineTool({
         name: "herdr_delegate",
         description:
-          "Send a task to an idle Herdr agent and return after submission, without waiting for completion. Automatically subscribe for an automated follow-up when the agent finishes or is blocked. Pass the user's request directly with only relevant context; let the agent investigate and plan. Busy, blocked, or unknown agents receive no input. Uncertain submissions are never automatically retried; inspect existing work first.",
+          "Send a task, follow-up, or correction to an idle or working Herdr agent. Returns after text and Enter reach the PTY, without waiting for execution. A working agent handles this input according to its own queueing behavior; pi queues it as steering for the next response, not a separate after-task follow-up. Automatically subscribe to worker state updates, reusing an active subscription when working. Updates are not message-specific completion receipts; the current run may finish before queued input is processed. Pass the user's request directly with only relevant context; let the agent investigate and plan. Blocked agents require interactive input and Herdr rejects prompts; unknown agents receive no input. Uncertain submissions are never automatically retried; inspect existing work first.",
         parameters: Type.Object(
           { agent_target: agentTarget, task: Type.String({ minLength: 1, maxLength: 100_000 }) },
           strict,
@@ -456,14 +456,23 @@ export function herdrIntegration(config: BotConfig) {
             const current = await get(client, agent.pane_id, context);
             if (current.terminal_id !== agent.terminal_id)
               throw new Error("Worker was replaced before delegation");
-            if (current.agent_status !== "idle" && current.agent_status !== "done") {
+            if (current.agent_status === "blocked" || current.agent_status === "unknown") {
               const final = await report(client, current, context);
               const reason =
-                "Worker is busy, blocked or unknown. No text was sent; ask the user if needed.";
+                current.agent_status === "blocked"
+                  ? "Worker is blocked and requires interactive input. Herdr rejects prompts in this state; no text was sent. Inspect the blocker and ask the user before answering it."
+                  : "Worker status is unknown. No text was sent; inspect the worker before sending input.";
               return { output: content({ ...final, submitted: false, reason }) };
             }
+            const working = current.agent_status === "working";
             const details = await describe(current, api, context);
-            const subscription = await subscribe(current, details.workspace, true, api, context);
+            const subscription = await subscribe(
+              current,
+              details.workspace,
+              !working,
+              api,
+              context,
+            );
             try {
               const result = await client.request(
                 "agent.prompt",
@@ -471,7 +480,15 @@ export function herdrIntegration(config: BotConfig) {
                 context,
               );
               const submitted = agentResult.parse(result).agent;
-              return { output: content({ agent: submitted, subscription, submitted: true }) };
+              return {
+                output: content({
+                  agent: submitted,
+                  subscription,
+                  submitted: true,
+                  submitted_while_working: working,
+                  note: "Text and Enter were submitted to the PTY. The worker controls queueing and processing; subscription updates report worker state, not completion of this specific message.",
+                }),
+              };
             } catch (error) {
               context.abortSignal?.throwIfAborted();
               const final = await report(
@@ -480,14 +497,24 @@ export function herdrIntegration(config: BotConfig) {
                 context,
               );
               const message = error instanceof Error ? error.message : String(error);
+              const rejected =
+                error instanceof HerdrError &&
+                [
+                  "agent_blocked",
+                  "agent_not_ready",
+                  "agent_not_found",
+                  "empty_agent_prompt",
+                ].includes(error.code);
               return {
                 output: content({
                   ...final,
                   subscription,
-                  submitted: "uncertain",
+                  submitted: rejected ? false : "uncertain",
                   timed_out: error instanceof HerdrError && error.code === "timeout",
                   error: message,
-                  note: "Check existing work before resending. The text was not automatically retried.",
+                  note: rejected
+                    ? "Herdr rejected the prompt before sending input. Inspect the worker before deciding what to do next."
+                    : "Check existing work before resending. The text was not automatically retried.",
                 }),
               };
             }

@@ -1,6 +1,7 @@
 import { defineExtension, section } from "@earendil-works/pi-durable";
 import type { BotConfig } from "./config.ts";
 import { herdrIntegration } from "./herdr.ts";
+import { instructionSection } from "./instructions.ts";
 
 export function botTools(config: BotConfig) {
   const herdr = herdrIntegration(config);
@@ -18,6 +19,7 @@ export function botTools(config: BotConfig) {
           ].join("\n"),
         { tag: false },
       ),
+      instructionSection(),
     ],
     tools: herdr.tools,
     tasks: herdr.tasks,
