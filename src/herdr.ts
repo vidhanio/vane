@@ -60,7 +60,8 @@ type WatchInput = {
   origin: EntryId;
 };
 type WatchState =
-  { phase: "watch"; seenWorking: boolean; errors: number } | { phase: "notify"; message: string };
+  | { phase: "watch"; seenWorking: boolean; errors: number; polls: number }
+  | { phase: "notify"; message: string };
 
 async function subscriptionKey(
   tx: Tx,
@@ -208,7 +209,7 @@ export function herdrIntegration(config: BotConfig) {
   const Watcher = defineTask<WatchInput, WatchState, null>({
     name: "vane.herdr.watch",
     version: 1,
-    initial: () => ({ phase: "watch", seenWorking: false, errors: 0 }),
+    initial: () => ({ phase: "watch", seenWorking: false, errors: 0, polls: 0 }),
     phases: {
       watch: async (task, runtime, context) => {
         const input = task.input;
@@ -248,7 +249,7 @@ export function herdrIntegration(config: BotConfig) {
             status: "running",
             checkpoint:
               message === undefined
-                ? { phase: "watch", seenWorking, errors }
+                ? { phase: "watch", seenWorking, errors, polls: task.state.checkpoint.polls + 1 }
                 : { phase: "notify", message },
           }),
           context,
