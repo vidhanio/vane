@@ -1,3 +1,3 @@
-# vidhan-bot
+# vane
 
-my bot
+my personal bot

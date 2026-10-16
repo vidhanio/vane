@@ -1,28 +1,11 @@
-import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
-  contentText,
-  type ImageContent,
-  type TextContent,
-  type ToolCall,
-} from "@earendil-works/pi-ai";
-import {
-  AssistantEntry,
-  defineDoc,
-  defineEntry,
   LiveDoc,
-  SessionFailed,
   UsageDoc,
   type Agent,
-  type Conversation,
-  type ConversationId,
   type ConversationView,
-  type Cursor,
-  type EntryId,
   type LiveState,
-  type Submission,
   type UsageState,
-  type UserInput,
 } from "@earendil-works/pi-durable";
 import {
   AttachmentBuilder,
@@ -38,71 +21,49 @@ import {
   MessageFlags,
   Partials,
   SlashCommandBuilder,
-  ThreadAutoArchiveDuration,
-  type Attachment as DiscordAttachment,
-  type Channel,
   type ChatInputCommandInteraction,
-  type Message,
   type DMChannel,
   type PartialDMChannel,
-  type TextChannel,
-  type ThreadChannel,
+  type Message,
 } from "discord.js";
 import { createHash } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Bot } from "../bot.ts";
 import { log } from "../log.ts";
-import { AgentNotification } from "../notifications.ts";
+import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../session.ts";
+import { messageContent } from "./discord-content.ts";
 
 const context = BACKGROUND_CONTEXT;
-const snowflake = z.string().regex(/^\d{17,20}$/);
 const configSchema = z.strictObject({
   token: z.string().min(1),
-  guild_id: snowflake,
-  channel_id: snowflake,
-  allowed_user_ids: z.array(snowflake).min(1),
+  allowed_user_ids: z.array(z.string().regex(/^\d{17,20}$/)).min(1),
 });
-type DiscordConfig = z.infer<typeof configSchema>;
 
-type DiscordThread = ThreadChannel | DMChannel | PartialDMChannel;
-const threadKey = (thread: DiscordThread) => (thread.type === ChannelType.DM ? "dm" : thread.id);
+const commands = (
+  [
+    ["stop", "Stop the current response and cancel queued messages"],
+    ["status", "Show the shared session's activity, model and usage"],
+    ["reset", "Cancel all work and reset the shared session"],
+  ] as const
+).map(([name, description]) =>
+  new SlashCommandBuilder()
+    .setName(name)
+    .setDescription(description)
+    .setContexts(InteractionContextType.BotDM),
+);
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName("stop")
-    .setDescription("Stop the response running in this conversation")
-    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("Show this conversation's activity, model and usage")
-    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
-  new SlashCommandBuilder()
-    .setName("reset")
-    .setDescription("Reset this conversation to a fresh context")
-    .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM),
-];
-
-export class Discord {
+export class Discord implements DirectMessageIntegration {
   readonly name = "discord";
   private readonly client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.MessageContent,
-    ],
+    intents: [GatewayIntentBits.DirectMessages],
     partials: [Partials.Channel],
     allowedMentions: { parse: [], repliedUser: false },
   });
-  private readonly config: DiscordConfig;
-  private channel: TextChannel | undefined;
-  private stopping = false;
-  private restoring = Promise.resolve();
+  private readonly config: z.infer<typeof configSchema>;
+  private stopping = true;
   private readonly running = new Set<Promise<void>>();
-  private readonly conversations = new Map<string, Promise<DiscordConversation>>();
-  private readonly bindings = new Map<string, ConversationId>();
+  private readonly progressText = new Map<string, string>();
 
   constructor(
     private readonly bot: Bot,
@@ -117,86 +78,102 @@ export class Discord {
     );
     this.client.on(Events.Error, (error) => console.error("Discord error", error));
     this.client.on(Events.MessageCreate, (message) => {
-      if (this.stopping || !this.channel || !this.allowed(message)) return;
-      this.track(this.restoring.then(() => this.handle(message)));
+      if (
+        this.stopping ||
+        message.channel.type !== ChannelType.DM ||
+        message.author.bot ||
+        !this.config.allowed_user_ids.includes(message.author.id)
+      )
+        return;
+      if (!message.content.trim() && !message.attachments.size) return;
+      this.track(
+        this.bot.session
+          .submit(
+            { platform: this.name, channelId: message.channelId, messageId: message.id },
+            (signal) => messageContent(message, signal),
+          )
+          .catch(async (error: unknown) => {
+            console.error("Discord submission failed", error);
+            await message.reply(responseOptions(errorText(error)));
+          }),
+      );
     });
     this.client.on(Events.InteractionCreate, (interaction) => {
-      if (this.stopping || !this.channel || !interaction.isChatInputCommand()) return;
-      this.track(this.restoring.then(() => this.handleCommand(interaction)));
+      if (!this.stopping && interaction.isChatInputCommand())
+        this.track(this.handleCommand(interaction));
     });
     await this.client.login(this.config.token);
     await ready;
-    const guild = await this.client.guilds.fetch(this.config.guild_id);
-    const application = this.client.application;
-    if (!application) throw new Error("Discord application is unavailable");
-    await Promise.all([
-      guild.commands.set(commands.map((command) => command.toJSON())),
-      application.commands.set(
-        commands.map((command) => ({
-          ...command.toJSON(),
-          contexts: [InteractionContextType.BotDM],
-        })),
-      ),
-    ]).catch((error: unknown) => {
-      throw new Error(
-        "Could not register application commands; the bot needs the applications.commands scope.",
-        { cause: error },
-      );
-    });
-    const channel = await this.client.channels.fetch(this.config.channel_id);
-    if (channel?.type !== ChannelType.GuildText || channel.guildId !== this.config.guild_id)
-      throw new Error("discord channel_id must be a text channel in discord guild_id");
-    this.channel = channel;
-    this.restoring = this.restore();
-    await this.restoring;
-    log("discord.connected", {
-      guildId: guild.id,
-      channelId: channel.id,
-      userId: this.client.user?.id,
-    });
+    if (!this.client.application) throw new Error("Discord application is unavailable");
+    await this.client.application.commands.set(commands.map((command) => command.toJSON()));
+    this.bot.session.connect(this);
+    this.stopping = false;
+    log("discord.connected", { userId: this.client.user?.id });
   }
 
   async stop(): Promise<void> {
-    log("discord.stopping", { activeMessages: this.running.size });
     this.stopping = true;
     await Promise.allSettled(this.running);
-    const conversations = await Promise.all(this.conversations.values());
-    await Promise.allSettled(conversations.map((item) => item.conversation.waitForIdle(context)));
-    await Promise.allSettled(conversations.map((item) => item.close()));
-    this.conversations.clear();
-    this.bindings.clear();
+  }
+
+  async close(): Promise<void> {
     await this.client.destroy();
     log("discord.disconnected");
   }
 
-  private async restore(): Promise<void> {
-    let cursor: Cursor | undefined;
-    do {
-      const page = await this.bot.harness.commit(
-        (tx) => tx.scanConversations({}, 100, cursor),
-        context,
-      );
-      for (const record of page.items) {
-        const connection = await this.bot.harness.snapshot(DiscordConnection, record.id, context);
-        if (!connection?.threadId) continue;
-        this.bindings.set(connection.dm ? "dm" : connection.threadId, record.id);
-        try {
-          const thread = this.configuredThread(
-            await this.client.channels.fetch(connection.threadId),
-          );
-          if (!thread) continue;
-          const conversation = await this.bot.harness.conversation(record.id, context);
-          if (conversation) await this.attach(thread, conversation);
-        } catch (error) {
-          console.error("Could not restore Discord conversation", {
-            conversationId: record.id,
-            threadId: connection.threadId,
-            error,
-          });
-        }
+  async progress(
+    origin: MessageOrigin,
+    calls: ToolActivity[],
+    id: string | undefined,
+    key: string,
+  ): Promise<string> {
+    const channel = await this.channel(origin);
+    const text = calls.map(toolText).join("\n");
+    if (id && this.progressText.get(id) === text) return id;
+    const options = responseOptions(text, "tool-calls.md");
+    let message: Message | undefined;
+    if (id) {
+      try {
+        message = await channel.messages.edit(id, options);
+      } catch (error) {
+        if (!unknownMessage(error)) throw error;
+        this.progressText.delete(id);
       }
-      cursor = page.next;
-    } while (cursor);
+    }
+    message ??= await channel.send({ ...options, nonce: nonce(key), enforceNonce: true });
+    this.progressText.set(message.id, text);
+    return message.id;
+  }
+
+  async removeProgress(origin: MessageOrigin, id: string): Promise<void> {
+    const channel = await this.channel(origin);
+    try {
+      await channel.messages.delete(id);
+    } catch (error) {
+      if (!unknownMessage(error)) throw error;
+    }
+    this.progressText.delete(id);
+  }
+
+  async reply(origin: MessageOrigin, text: string, key: string): Promise<void> {
+    const channel = await this.channel(origin);
+    await channel.send({
+      ...responseOptions(text),
+      reply: { messageReference: origin.messageId, failIfNotExists: false },
+      nonce: nonce(key),
+      enforceNonce: true,
+    });
+  }
+
+  private async channel(origin: MessageOrigin): Promise<DMChannel | PartialDMChannel> {
+    const channel = await this.client.channels.fetch(origin.channelId);
+    if (
+      channel?.type !== ChannelType.DM ||
+      !channel.recipient ||
+      !this.config.allowed_user_ids.includes(channel.recipient.id)
+    )
+      throw new Error(`Discord DM is unavailable: ${origin.channelId}`);
+    return channel;
   }
 
   private track(work: Promise<void>): void {
@@ -206,510 +183,93 @@ export class Discord {
     this.running.add(tracked);
   }
 
-  /** Connect a Discord thread to a native conversation, creating one only when omitted. */
-  attach(thread: DiscordThread, conversation?: Conversation): Promise<DiscordConversation> {
-    if (
-      thread.type !== ChannelType.DM &&
-      (thread.parentId !== this.config.channel_id || thread.guildId !== this.config.guild_id)
-    )
-      throw new Error("Thread is outside the configured Discord channel");
-    const key = threadKey(thread);
-    const existing = this.conversations.get(key);
-    if (existing)
-      return existing.then((attached) => {
-        if (conversation && attached.conversation.id !== conversation.id)
-          throw new Error("Discord thread is already connected to another conversation");
-        return attached;
-      });
-    const bound = this.bindings.get(key);
-    if (conversation && bound !== undefined && bound !== conversation.id)
-      throw new Error("Discord thread is already connected to another conversation");
-    const opening = (
-      conversation
-        ? Promise.resolve(conversation)
-        : bound !== undefined
-          ? this.bot.harness.conversation(bound, context)
-          : this.bot.harness.createConversation(
-              {
-                ownership: { kind: "ownerless" },
-                init: async (tx, id) => {
-                  const connection = await tx.doc(DiscordConnection, id);
-                  connection.threadId = thread.id;
-                  connection.dm = thread.type === ChannelType.DM;
-                },
-              },
-              context,
-            )
-    )
-      .then(async (native) => {
-        if (!native) throw new Error(`Missing conversation for Discord thread ${thread.id}`);
-        const attached = await DiscordConversation.open(native, thread);
-        this.bindings.set(key, native.id);
-        return attached;
-      })
-      .catch((error: unknown) => {
-        this.conversations.delete(key);
-        throw error;
-      });
-    this.conversations.set(key, opening);
-    return opening;
-  }
-
-  private allowed(message: Message): boolean {
-    return (
-      !message.author.bot &&
-      this.config.allowed_user_ids.includes(message.author.id) &&
-      ((message.guildId === this.config.guild_id && message.channelId === this.config.channel_id) ||
-        this.configuredThread(message.channel) !== undefined)
-    );
-  }
-
-  private configuredThread(channel: Channel | null): DiscordThread | undefined {
-    if (channel?.type === ChannelType.DM) return channel;
-    if (!channel?.isThread()) return undefined;
-    return channel.parentId === this.config.channel_id && channel.guildId === this.config.guild_id
-      ? channel
-      : undefined;
-  }
-
-  private async handle(message: Message): Promise<void> {
-    const content = message.content.trim();
-    if (!content && message.attachments.size === 0) return;
-    log("discord.message_received", {
-      messageId: message.id,
-      channelId: message.channelId,
-      userId: message.author.id,
-      textLength: content.length,
-      attachments: message.attachments.size,
-    });
-    const thread = this.configuredThread(message.channel) ?? (await this.thread(message));
-    try {
-      await (await this.attach(thread)).submit(message);
-    } catch (error) {
-      console.error(`Discord thread ${thread.id} failed`, error);
-      if (!this.stopping) await thread.send(responseOptions(errorText(error)));
-    }
-  }
-
   private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    log("discord.command_received", {
-      command: interaction.commandName,
-      userId: interaction.user.id,
-      channelId: interaction.channelId,
-    });
     if (
-      (interaction.guildId !== null && interaction.guildId !== this.config.guild_id) ||
+      interaction.guildId !== null ||
       !this.config.allowed_user_ids.includes(interaction.user.id)
     ) {
       await interaction.reply({
-        content: "vidhan-bot is not available to you.",
+        content: "vane is not available to you.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const thread = this.configuredThread(interaction.channel);
-      const attached =
-        thread?.type === ChannelType.DM
-          ? await this.attach(thread)
-          : thread
-            ? await this.conversations.get(threadKey(thread))
-            : undefined;
-      if (!attached) {
-        await interaction.editReply("Use this command in a connected conversation thread.");
-        return;
-      }
       switch (interaction.commandName) {
         case "stop":
-          await attached.conversation.abort(context);
-          await interaction.deleteReply();
-          return;
+          await this.bot.session.stop();
+          await interaction.editReply("Response stopped; queued messages cancelled.");
+          break;
         case "reset":
-          await attached.reset();
-          await interaction.editReply("Conversation reset.");
-          return;
+          await this.bot.session.reset();
+          await interaction.editReply("Shared session reset.");
+          break;
         case "status":
-          await interaction.editReply({ embeds: [await attached.status()] });
-          return;
+          await interaction.editReply({
+            embeds: [
+              conversationEmbed(
+                await this.bot.session.conversation.agent(context),
+                this.bot.session.view.value,
+              ),
+            ],
+          });
+          break;
         default:
           await interaction.editReply("Unknown command.");
       }
     } catch (error) {
-      console.error(`Command ${interaction.commandName} failed`, error);
-      await interaction.editReply(errorText(error)).catch(() => undefined);
+      console.error(`Discord command ${interaction.commandName} failed`, error);
+      await interaction.editReply(errorText(error));
     }
-  }
-
-  private async thread(message: Message): Promise<ThreadChannel> {
-    if (message.thread) return message.thread;
-    const thread = await message.startThread({
-      name:
-        message.cleanContent.replace(/\s+/g, " ").slice(0, 100).toWellFormed() ||
-        "New conversation",
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-    });
-    log("discord.thread_created", { threadId: thread.id, messageId: message.id });
-    return thread;
   }
 }
 
-const DiscordMessage = defineEntry<string>("vidhan-bot.message.discord");
-const DiscordDMMessage = defineEntry<{ messageId: string; channelId: string }>(
-  "vidhan-bot.message.discord.dm",
-);
-const requestId = (id: string) => `${DiscordMessage.kind}:${id}`;
-const DiscordConnection = defineDoc<{ threadId?: string; dm?: boolean }>({
-  kind: "vidhan-bot.conversation.discord",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({}),
-});
-type DeliveryState = { lastHandledInput?: EntryId; pendingReplyId?: string };
-const DiscordDelivery = defineDoc<DeliveryState>({
-  kind: "vidhan-bot.delivery.discord",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({}),
-});
-
-export class DiscordConversation {
-  private closed = false;
-  private closing: Promise<void> | undefined;
-  private incoming = Promise.resolve();
-  private work = Promise.resolve();
-  private updatedAt = 0;
-  private typing: ReturnType<typeof setInterval> | undefined;
-  private typingThread: DiscordThread;
-  private message: { input: EntryId; value: Message } | undefined;
-
-  private constructor(
-    readonly conversation: Conversation,
-    private readonly thread: DiscordThread,
-    private readonly view: AttachedReplicatedState<ConversationView>,
-    private readonly delivery: DeliveryState,
-  ) {
-    this.typingThread = thread;
-    view.subscribe(async () => {
-      if (this.closed) return;
-      this.setTyping(
-        Boolean((view.value.docs[LiveDoc.definition.kind] as LiveState | undefined)?.run),
-      );
-      this.work = this.refresh();
-      await this.work;
-    });
-  }
-
-  static async open(
-    conversation: Conversation,
-    thread: DiscordThread,
-  ): Promise<DiscordConversation> {
-    const delivery = await conversation.commit(async (tx) => {
-      const connection = await tx.doc(DiscordConnection, conversation.id);
-      if (
-        connection.threadId !== undefined &&
-        (connection.dm ? thread.type !== ChannelType.DM : connection.threadId !== thread.id)
-      )
-        throw new Error("Conversation is already connected to another Discord thread");
-      connection.threadId = thread.id;
-      connection.dm = thread.type === ChannelType.DM;
-      return { ...(await tx.doc(DiscordDelivery, conversation.id)) };
-    }, context);
-    return new DiscordConversation(
-      conversation,
-      thread,
-      await conversation.viewState(context),
-      delivery,
-    );
-  }
-
-  /** Translate and admit messages in arrival order; pi queues the runs. */
-  submit(message: Message): Promise<Submission> {
-    const submission = this.incoming.then(async () => {
-      if (this.closed) throw new Error("Discord conversation is closed");
-      const result = await this.conversation.submit(
-        {
-          type: "input",
-          content: await messageContent(message),
-          requestId: requestId(message.id),
-          entry:
-            message.channel.type === ChannelType.DM
-              ? {
-                  kind: DiscordDMMessage.kind,
-                  data: { messageId: message.id, channelId: message.channelId },
-                }
-              : { kind: DiscordMessage.kind, data: message.id },
-        },
-        context,
-      );
-      log("discord.message_submitted", {
-        threadId: this.thread.id,
-        messageId: message.id,
-        submissionId: result.id,
-      });
-      return result;
-    });
-    this.incoming = submission.then(
-      () => undefined,
-      () => undefined,
-    );
-    return submission;
-  }
-
-  reset(): Promise<void> {
-    const reset = this.incoming.then(() => this.conversation.reset(undefined, context));
-    this.incoming = reset.catch(() => undefined);
-    return reset;
-  }
-
-  async status(): Promise<EmbedBuilder> {
-    return conversationEmbed(await this.conversation.agent(context), this.view.value);
-  }
-
-  close(): Promise<void> {
-    return (this.closing ??= (async () => {
-      this.closed = true;
-      await this.incoming;
-      this.view.dispose();
-      this.setTyping(false);
-      await this.work;
-      await this.render(this.view.value);
-    })());
-  }
-
-  private async refresh(): Promise<void> {
-    while (!this.closed) {
-      try {
-        await delay(Math.max(0, 750 - (Date.now() - this.updatedAt)));
-        if (this.closed) return;
-        await this.render(this.view.value);
-        this.updatedAt = Date.now();
-        return;
-      } catch (error) {
-        console.error("Discord conversation update failed", { threadId: this.thread.id, error });
-        if (error instanceof SessionFailed) return;
-        await delay(5000);
-      }
-    }
-  }
-
-  private setTyping(active: boolean): void {
-    if (!active) {
-      if (this.typing !== undefined) clearInterval(this.typing);
-      this.typing = undefined;
-    } else if (this.typing === undefined && !this.closed) {
-      const ping = () => {
-        void this.typingThread
-          .sendTyping()
-          .catch((error: unknown) =>
-            console.error("Discord typing failed", { threadId: this.thread.id, error }),
-          );
-      };
-      ping();
-      this.typing = setInterval(ping, 8000);
-    }
-  }
-
-  private async render(view: ConversationView): Promise<void> {
-    const query = {
-      ...(this.delivery.lastHandledInput === undefined
-        ? {}
-        : { minEntryId: this.delivery.lastHandledInput }),
-      order: "ascending" as const,
-    };
-    let cursor: Cursor | undefined;
-    do {
-      const page = await this.conversation.entries(query, 100, cursor, context);
-      for (const input of page.items) {
-        if (
-          (!DiscordMessage.is(input) &&
-            !DiscordDMMessage.is(input) &&
-            !AgentNotification.is(input)) ||
-          (this.delivery.lastHandledInput !== undefined &&
-            input.id <= this.delivery.lastHandledInput)
-        )
-          continue;
-        const originId = AgentNotification.is(input) ? input.data.origin : undefined;
-        const origin =
-          originId === undefined
-            ? input
-            : await this.conversation.commit((tx) => tx.entry(originId), context);
-        const source = origin ?? input;
-        const messageId = DiscordDMMessage.is(source)
-          ? source.data.messageId
-          : DiscordMessage.is(source)
-            ? source.data
-            : String(input.id);
-        const thread = DiscordDMMessage.is(source)
-          ? await this.thread.client.channels.fetch(source.data.channelId)
-          : this.thread;
-        const submissionRequestId = AgentNotification.is(input)
-          ? input.data.requestId
-          : requestId(messageId);
-        if (!thread || (thread.type !== ChannelType.DM && !thread.isThread()))
-          throw new Error(`Missing Discord channel for input ${messageId}`);
-        const result = await this.conversation.commit(
-          (tx) => tx.submissionByRequest(this.conversation.id, submissionRequestId),
-          context,
-        );
-        if (!result || result.type !== "input")
-          throw new Error(`Missing Discord input ${messageId}`);
-        if (result.status === "placed" || result.status === "queued") {
-          this.typingThread = thread;
-          const text = renderToolLog(view, input.id);
-          if (text) await this.reply(input.id, text, thread);
-          return;
-        }
-        if (result.status === "done") {
-          const answer = await this.conversation.commit(
-            (tx) => tx.entry(AssistantEntry, result.answer),
-            context,
-          );
-          if (!answer) throw new Error(`Missing answer for Discord input ${messageId}`);
-          const text = answer.model
-            ?.flatMap((message) =>
-              message.role === "assistant" ? [contentText(message.content)] : [],
-            )
-            .join("\n");
-          await this.reply(input.id, text || "Completed with no text response.", thread);
-        } else if (result.reason === "aborted") {
-          const message = await this.currentMessage(input.id, thread);
-          if (message)
-            await message.delete().catch((error: unknown) => {
-              if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
-            });
-        } else {
-          await this.reply(
-            input.id,
-            `Conversation ended without an answer: ${result.reason}.`,
-            thread,
-          );
-        }
-        await this.conversation.commit(async (tx) => {
-          const delivery = await tx.doc(DiscordDelivery, this.conversation.id);
-          delivery.lastHandledInput = input.id;
-          delete delivery.pendingReplyId;
-        }, context);
-        this.delivery.lastHandledInput = input.id;
-        delete this.delivery.pendingReplyId;
-        this.message = undefined;
-        log("discord.response_delivered", {
-          conversationId: this.conversation.id,
-          messageId,
-          status: result.status,
-        });
-      }
-      cursor = page.next;
-    } while (cursor);
-  }
-
-  private async currentMessage(
-    input: EntryId,
-    thread: DiscordThread,
-  ): Promise<Message | undefined> {
-    if (this.message?.input === input) return this.message.value;
-    this.message = undefined;
-    const id = this.delivery.pendingReplyId;
-    if (id === undefined) return undefined;
-    try {
-      this.message = { input, value: await thread.messages.fetch(id) };
-    } catch (error) {
-      if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
-      await this.clearMessage();
-    }
-    return this.message?.value;
-  }
-
-  private async reply(input: EntryId, text: string, thread: DiscordThread): Promise<void> {
-    if (thread.isThread() && thread.archived) await thread.setArchived(false);
-    const message = await this.currentMessage(input, thread);
-    if (message) {
-      try {
-        if (message.content !== text || message.attachments.size > 0)
-          this.message = { input, value: await message.edit(responseOptions(text)) };
-        return;
-      } catch (error) {
-        if (!(error instanceof DiscordAPIError) || error.code !== 10008) throw error;
-        await this.clearMessage();
-      }
-    }
-    const nonce = createHash("sha256")
-      .update(`${this.conversation.id}:${input}`)
-      .digest("hex")
-      .slice(0, 24);
-    const sent = await thread.send({ ...responseOptions(text), nonce, enforceNonce: true });
-    this.message = { input, value: sent };
-    await this.conversation.commit(async (tx) => {
-      (await tx.doc(DiscordDelivery, this.conversation.id)).pendingReplyId = sent.id;
-    }, context);
-    this.delivery.pendingReplyId = sent.id;
-  }
-
-  private async clearMessage(): Promise<void> {
-    this.message = undefined;
-    await this.conversation.commit(async (tx) => {
-      delete (await tx.doc(DiscordDelivery, this.conversation.id)).pendingReplyId;
-    }, context);
-    delete this.delivery.pendingReplyId;
-  }
+function nonce(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 24);
 }
 
-const messageLimit = 1900;
-const imageLimit = 10 * 1024 * 1024;
-const imageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+function unknownMessage(error: unknown): boolean {
+  return error instanceof DiscordAPIError && error.code === 10008;
+}
 
-function responseOptions(text: string) {
-  return text.length <= messageLimit
+function responseOptions(text: string, name = "response.md") {
+  return text.length <= 2000
     ? { content: text, files: [], attachments: [] }
-    : {
-        content: "",
-        files: [new AttachmentBuilder(Buffer.from(text), { name: "response.md" })],
-        attachments: [],
-      };
+    : { content: "", files: [new AttachmentBuilder(Buffer.from(text), { name })], attachments: [] };
 }
 
 function codeText(text: string): string {
-  return stripVTControlCharacters(text).replaceAll("`", "`\u200b");
+  return stripVTControlCharacters(text).replaceAll("`", "`\u200b").toWellFormed();
 }
 
 function errorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return `ERROR:\n${codeBlock(codeText(message).toWellFormed())}`;
+  return `ERROR:\n${codeBlock(codeText(error instanceof Error ? error.message : String(error)))}`;
 }
 
-function clipped(text: string, limit: number): string {
-  return (
-    text.length > limit ? `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…` : text
-  ).toWellFormed();
+function inline(value: unknown): string {
+  return `\`${stripVTControlCharacters(typeof value === "string" ? value : "")
+    .replaceAll("`", "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toWellFormed()}\``;
 }
 
-function inline(value: unknown, limit = Infinity): string {
-  return `\`${clipped(
-    stripVTControlCharacters(typeof value === "string" ? value : "")
-      .replaceAll("`", "")
-      .replace(/\s+/g, " ")
-      .trim(),
-    limit,
-  )}\``;
-}
-
-function toolText(call: Pick<ToolCall, "name" | "arguments">, details: unknown): string {
+function toolText(call: ToolActivity): string {
   const args = call.arguments;
-  if (call.name === "codemode") {
-    const code = typeof args.code === "string" ? args.code : "";
-    return codeBlock("js", codeText(code).toWellFormed());
-  }
+  if (call.name === "codemode")
+    return codeBlock("js", codeText(typeof args.code === "string" ? args.code : ""));
   const parsed = z
     .object({ agent: z.string().optional(), workspace: z.string().optional() })
-    .safeParse(details);
+    .safeParse(call.details);
   const agent = inline(
-    parsed.success ? (parsed.data.agent ?? args.agent ?? args.name) : (args.agent ?? args.name),
+    parsed.success
+      ? (parsed.data.agent ?? args.agent_target ?? args.agent_name)
+      : (args.agent_target ?? args.agent_name),
   );
-  const workspace = parsed.success ? (parsed.data.workspace ?? args.workspace) : args.workspace;
+  const workspace = parsed.success
+    ? (parsed.data.workspace ?? args.workspace_id)
+    : args.workspace_id;
   const location = typeof workspace === "string" ? ` in ${inline(workspace)}` : "";
   let text: string;
   switch (call.name) {
@@ -723,13 +283,13 @@ function toolText(call: Pick<ToolCall, "name" | "arguments">, details: unknown):
       text = `writing ${inline(args.path)}`;
       break;
     case "bash":
-      text = `running ${inline(args.command, 80)}`;
+      text = `running ${inline(args.command)}`;
       break;
     case "herdr_list":
       text = "getting herdr status";
       break;
     case "herdr_create_workspace":
-      text = `creating workspace ${inline(args.name)} at ${inline(args.project)}`;
+      text = `creating workspace ${inline(args.workspace_name)} at ${inline(args.project_path)}`;
       break;
     case "herdr_create_agent":
       text = `creating agent ${agent}${location}`;
@@ -747,33 +307,6 @@ function toolText(call: Pick<ToolCall, "name" | "arguments">, details: unknown):
       text = `using ${inline(call.name)}`;
   }
   return `-# ${text}`;
-}
-
-function renderToolLog(view: ConversationView, input: EntryId): string {
-  const calls: Pick<ToolCall, "id" | "name" | "arguments">[] = [];
-  const details = new Map<string, unknown>();
-  const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
-  for (const slot of live?.tools ?? []) details.set(slot.callId, slot.details);
-  for (const slot of live?.nestedTools ?? []) details.set(slot.callId, slot.details);
-  for (const entry of view.entries) {
-    if (entry.id < input) continue;
-    for (const message of entry.model ?? []) {
-      if (message.role === "toolResult") details.set(message.toolCallId, message.details);
-      if (message.role === "assistant")
-        for (const block of message.content) {
-          if (block.type !== "toolCall") continue;
-          calls.push(block);
-          for (const slot of (live?.nestedTools ?? [])
-            .filter((nested) => nested.parentCallId === block.id)
-            .slice(-3))
-            calls.push({ id: slot.callId, name: slot.name, arguments: slot.arguments });
-        }
-    }
-  }
-  return calls
-    .slice(-10)
-    .map((call) => toolText(call, details.get(call.id)))
-    .join("\n");
 }
 
 function conversationEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
@@ -798,7 +331,7 @@ function conversationEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
     }
   return new EmbedBuilder()
     .setColor(Colors.Blurple)
-    .setTitle("Conversation status")
+    .setTitle("Shared session status")
     .addFields(
       { name: "Status", value: activity, inline: true },
       {
@@ -814,64 +347,4 @@ function conversationEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
       },
       { name: "Directory", value: `\`${agent.cwd ?? "Not configured"}\``, inline: false },
     );
-}
-
-async function messageContent(message: Message): Promise<UserInput> {
-  const content: (TextContent | ImageContent)[] = [{ type: "text", text: message.content.trim() }];
-  let imageBytes = 0;
-  let imageCount = 0;
-  for (const item of message.attachments.values()) {
-    content.push({ type: "text", text: `Attachment (untrusted URL): ${item.url}` });
-    const includeImage = Boolean(
-      item.contentType?.startsWith("image/") &&
-      imageCount < 4 &&
-      imageBytes + item.size <= 20 * 1024 * 1024,
-    );
-    if (includeImage) {
-      imageCount += 1;
-      imageBytes += item.size;
-    }
-    const image = await readImage(item, includeImage);
-    if (image) content.push(image);
-  }
-  return content;
-}
-
-async function readImage(
-  item: DiscordAttachment,
-  images: boolean,
-): Promise<ImageContent | undefined> {
-  const mimeType = item.contentType?.split(";", 1)[0]?.toLowerCase();
-  if (!images || !mimeType || !imageTypes.has(mimeType) || item.size > imageLimit) return undefined;
-  const url = new URL(item.url);
-  if (
-    url.protocol !== "https:" ||
-    !["cdn.discordapp.com", "media.discordapp.net"].includes(url.hostname)
-  )
-    return undefined;
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: "error" });
-    if (!response.ok || !response.body)
-      throw new Error(`Image download failed: HTTP ${response.status}`);
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    try {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        size += chunk.value.byteLength;
-        if (size > Math.min(imageLimit, item.size))
-          throw new Error("Image attachment exceeds its size limit");
-        chunks.push(chunk.value);
-      }
-    } finally {
-      await reader.cancel();
-    }
-    log("discord.image_loaded", { attachmentId: item.id, bytes: size, mimeType });
-    return { type: "image", data: Buffer.concat(chunks).toString("base64"), mimeType };
-  } catch (error) {
-    console.error("Discord image download failed", { attachmentId: item.id, error });
-    return undefined;
-  }
 }

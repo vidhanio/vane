@@ -1,24 +1,26 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { configure, createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { lock } from "proper-lockfile";
 import type { BotConfig } from "./config.ts";
 import { botTools } from "./tools.ts";
 import { log } from "./log.ts";
+import { Session } from "./session.ts";
 
 const context = BACKGROUND_CONTEXT;
 
-/** Owns the shared pi session and configures new independent conversations. */
+/** Owns the single shared DM session and its durable runtime. */
 export class Bot {
   private constructor(
     readonly harness: Harness,
+    readonly session: Session,
     private readonly release: () => Promise<void>,
     private readonly sandbox: CodemodeSandbox,
   ) {}
@@ -47,9 +49,7 @@ export class Bot {
           ],
         }),
       );
-      const storage = await openNodeJsonlStorage(join(config.state_dir, "sessions"), context, {
-        fsync: true,
-      });
+      const storage = await openNodeSqliteStorage(join(config.state_dir, "vane.sqlite"));
       const harness = await Harness.open(
         storage,
         {
@@ -57,14 +57,6 @@ export class Bot {
           registry,
           env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? config.agent.cwd }),
           settings: { toolExecution: "parallel" },
-          conversationCreated: async (tx, conversation) => {
-            if (conversation.owner || conversation.parent) return;
-            await configure(tx, conversation.id, {
-              model: { provider: config.agent.provider, modelId: config.agent.model_id },
-              thinkingLevel: config.agent.thinking,
-              cwd: config.agent.cwd,
-            });
-          },
           onReport: (error) => console.error("Agent error", error),
         },
         context,
@@ -72,13 +64,26 @@ export class Bot {
         await storage.close(context);
         throw error;
       });
-      harness.resume();
       log("agent.opened", {
         stateDir: config.state_dir,
         provider: config.agent.provider,
         model: config.agent.model_id,
       });
-      return new Bot(harness, release, sandbox);
+      const session = await harness
+        .root(context, {
+          agent: {
+            model: { provider: config.agent.provider, modelId: config.agent.model_id },
+            thinkingLevel: config.agent.thinking,
+            cwd: config.agent.cwd,
+          },
+        })
+        .then((conversation) => Session.open(conversation))
+        .catch(async (error: unknown) => {
+          await harness.close(context);
+          throw error;
+        });
+      harness.resume();
+      return new Bot(harness, session, release, sandbox);
     } catch (error) {
       try {
         await sandbox?.close();
@@ -91,7 +96,11 @@ export class Bot {
 
   async close(): Promise<void> {
     try {
-      await this.harness.close(context);
+      try {
+        await this.session.close();
+      } finally {
+        await this.harness.close(context);
+      }
     } finally {
       try {
         await this.sandbox.close();

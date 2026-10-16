@@ -1,5 +1,5 @@
 {
-  description = "vidhan-bot: durable agent with pluggable platforms";
+  description = "vane: durable agent with pluggable DM integrations";
 
   inputs = {
     flake-parts = {
@@ -63,7 +63,7 @@
             ];
           };
           packages.default = pkgs.callPackage ./nix/package.nix { };
-          checks.vidhan-bot = config.packages.default;
+          checks.vane = config.packages.default;
           treefmt = {
             projectRootFile = "flake.nix";
             settings.formatter.bun = {

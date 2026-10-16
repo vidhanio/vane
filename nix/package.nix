@@ -33,11 +33,11 @@ bun2nix.mkDerivation {
     runHook postCheck
   '';
   postInstall = ''
-    wrapProgram "$out/bin/vidhan-bot" \
+    wrapProgram "$out/bin/vane" \
       --prefix PATH : ${lib.makeBinPath [ herdr ]}
   '';
   meta = {
-    description = "vidhan-bot";
+    description = "vane";
     platforms = lib.platforms.linux;
   };
 }

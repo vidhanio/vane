@@ -1,15 +1,17 @@
 #!/usr/bin/env bun
 
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { Bot } from "./bot.ts";
 import { loadConfig, type BotConfig } from "./config.ts";
 import { Discord } from "./platforms/discord.ts";
 import { log } from "./log.ts";
 
 function configPath(): string {
-  const file = process.env.VIDHAN_BOT_CONFIG;
-  if (!file) throw new Error("Set VIDHAN_BOT_CONFIG to the config file path");
-  return resolve(file);
+  return resolve(
+    process.env.VANE_CONFIG ??
+      join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "vane/config.toml"),
+  );
 }
 
 function platforms(config: BotConfig, bot: Bot): Discord[] {
@@ -55,17 +57,21 @@ async function main(): Promise<void> {
     log("service.starting", { platforms: enabled.map((platform) => platform.name) });
     for (const platform of enabled) await platform.start();
     console.log(
-      `vidhan-bot ready; platforms: ${enabled.map((platform) => platform.name).join(", ")}; state: ${config.state_dir}`,
+      `vane ready; platforms: ${enabled.map((platform) => platform.name).join(", ")}; state: ${config.state_dir}`,
     );
     await waitForShutdown(bot);
   } finally {
     await Promise.allSettled(enabled.map((platform) => platform.stop()));
-    await bot.close();
+    try {
+      await bot.close();
+    } finally {
+      await Promise.allSettled(enabled.map((platform) => platform.close()));
+    }
     log("service.stopped");
   }
 }
 
 main().catch((error: unknown) => {
-  console.error("vidhan-bot failed", error);
+  console.error("vane failed", error);
   process.exitCode = 1;
 });

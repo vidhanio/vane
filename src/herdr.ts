@@ -18,7 +18,10 @@ import { HerdrClient, HerdrError } from "./herdr-client.ts";
 import { AgentNotification } from "./notifications.ts";
 
 const strict = { additionalProperties: false };
-const target = Type.String({ minLength: 1, description: "Live agent name or pane ID." });
+const agentTarget = Type.String({
+  minLength: 1,
+  description: "Existing agent name or pane_id from herdr_list; not a workspace ID or label.",
+});
 const agentSchema = z.object({
   terminal_id: z.string(),
   pane_id: z.string(),
@@ -37,7 +40,7 @@ const agentSchema = z.object({
 type Agent = z.infer<typeof agentSchema>;
 const agentResult = z.object({ agent: agentSchema });
 const Subscriptions = defineDoc<{ agents: Record<string, TaskId<null>> }>({
-  kind: "vidhan-bot.herdr.subscriptions",
+  kind: "vane.herdr.subscriptions",
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -171,7 +174,7 @@ export function herdrIntegration(config: BotConfig) {
     return details;
   };
   const Watcher = defineTask<WatchInput, WatchState, null>({
-    name: "vidhan-bot.herdr.watch",
+    name: "vane.herdr.watch",
     version: 1,
     initial: () => ({ phase: "watch", seenWorking: false, errors: 0, polls: 0 }),
     phases: {
@@ -311,7 +314,7 @@ export function herdrIntegration(config: BotConfig) {
       defineTool({
         name: "herdr_list",
         description:
-          "List Herdr workspaces and live agents to find an existing workspace or worker.",
+          "List Herdr workspaces and live agents. Use workspace_id (not label) to create an agent, and an agent's name or pane_id to read, subscribe, or delegate.",
         parameters: Type.Object({}, strict),
         execute: async (_args, _api, context) => {
           const [workspaceResult, agentList] = await Promise.all([
@@ -333,20 +336,27 @@ export function herdrIntegration(config: BotConfig) {
           "Open a Herdr workspace at an existing project directory without changing focus.",
         parameters: Type.Object(
           {
-            project: Type.String({ minLength: 1, pattern: "^(?:/|~/)" }),
-            name: Type.String({ minLength: 1 }),
+            project_path: Type.String({
+              minLength: 1,
+              pattern: "^(?:/|~/)",
+              description: "Existing project directory, as an absolute path or ~/ path.",
+            }),
+            workspace_name: Type.String({
+              minLength: 1,
+              description: "Display label for the new workspace; not an existing workspace_id.",
+            }),
           },
           strict,
         ),
         execute: async (args, _api, context) => {
-          const project = pathSchema.parse(args.project);
+          const project = pathSchema.parse(args.project_path);
           if (!(await stat(project)).isDirectory())
             throw new Error("Project must be an existing directory");
           return {
             output: content(
               await client.request(
                 "workspace.create",
-                { cwd: project, label: args.name, focus: false },
+                { cwd: project, label: args.workspace_name, focus: false },
                 context,
               ),
             ),
@@ -359,21 +369,28 @@ export function herdrIntegration(config: BotConfig) {
           "Start a named agent in a new tab in an existing Herdr workspace without changing focus. Uses the workspace's working directory and starts pi. Returns when the agent is ready; ask the user about startup blockers before sending input.",
         parameters: Type.Object(
           {
-            workspace: Type.String({ minLength: 1 }),
-            name: Type.String({ pattern: "^[a-z][a-z0-9_-]{0,31}$" }),
+            workspace_id: Type.String({
+              minLength: 1,
+              description:
+                "Exact workspace_id from herdr_list or herdr_create_workspace; not the workspace's label.",
+            }),
+            agent_name: Type.String({
+              pattern: "^[a-z][a-z0-9_-]{0,31}$",
+              description: "Name to assign to the new agent.",
+            }),
           },
           strict,
         ),
         execute: async (args, api, context) => {
           await api.details(
-            { agent: args.name, workspace: await workspaceName(args.workspace, context) },
+            { agent: args.agent_name, workspace: await workspaceName(args.workspace_id, context) },
             context,
           );
           const { panes } = z
             .object({
               panes: z.array(z.object({ cwd: z.string().nullish(), focused: z.boolean() })),
             })
-            .parse(await client.request("pane.list", { workspace_id: args.workspace }, context));
+            .parse(await client.request("pane.list", { workspace_id: args.workspace_id }, context));
           const cwd =
             panes.find((pane) => pane.focused && pane.cwd)?.cwd ??
             panes.find((pane) => pane.cwd)?.cwd;
@@ -383,14 +400,14 @@ export function herdrIntegration(config: BotConfig) {
             .parse(
               await client.request(
                 "tab.create",
-                { workspace_id: args.workspace, cwd, label: args.name, focus: false },
+                { workspace_id: args.workspace_id, cwd, label: args.agent_name, focus: false },
                 context,
               ),
             );
-          api.output(`Starting ${args.name} in ${args.workspace}…\n`);
+          api.output(`Starting ${args.agent_name} in ${args.workspace_id}…\n`);
           try {
             return {
-              output: content(await start(client, tab.root_pane.pane_id, args.name, context)),
+              output: content(await start(client, tab.root_pane.pane_id, args.agent_name, context)),
             };
           } catch (error) {
             context.abortSignal?.throwIfAborted();
@@ -405,9 +422,9 @@ export function herdrIntegration(config: BotConfig) {
         name: "herdr_read",
         description:
           "Read a Herdr agent's current status and terminal output without sending input. Use to check existing work, blockers, or uncertain submissions before considering another delegation.",
-        parameters: Type.Object({ agent: target }, strict),
+        parameters: Type.Object({ agent_target: agentTarget }, strict),
         execute: async (args, api, context) => {
-          const agent = await get(client, args.agent, context);
+          const agent = await get(client, args.agent_target, context);
           await describe(agent, api, context);
           return { output: content(await report(client, agent, context)) };
         },
@@ -416,9 +433,9 @@ export function herdrIntegration(config: BotConfig) {
         name: "herdr_subscribe",
         description:
           "Subscribe once to a Herdr agent's current work, even if you did not delegate it. Returns immediately; an automated follow-up reports completion, a blocker, or monitoring failure. Already idle or done agents report their current result. Subscriptions survive restarts. This watches agent state, not a uniquely identified Herdr task.",
-        parameters: Type.Object({ agent: target }, strict),
+        parameters: Type.Object({ agent_target: agentTarget }, strict),
         execute: async (args, api, context) => {
-          const agent = await get(client, args.agent, context);
+          const agent = await get(client, args.agent_target, context);
           const details = await describe(agent, api, context);
           const subscription = await subscribe(agent, details.workspace, false, api, context);
           return { output: content({ ...details, subscription, subscribed: true }) };
@@ -429,11 +446,11 @@ export function herdrIntegration(config: BotConfig) {
         description:
           "Send a task to an idle Herdr agent and return after submission, without waiting for completion. Automatically subscribe for an automated follow-up when the agent finishes or is blocked. Pass the user's request directly with only relevant context; let the agent investigate and plan. Busy, blocked, or unknown agents receive no input. Uncertain submissions are never automatically retried; inspect existing work first.",
         parameters: Type.Object(
-          { agent: target, task: Type.String({ minLength: 1, maxLength: 100_000 }) },
+          { agent_target: agentTarget, task: Type.String({ minLength: 1, maxLength: 100_000 }) },
           strict,
         ),
         execute: async (args, api, context) => {
-          const agent = await get(client, args.agent, context);
+          const agent = await get(client, args.agent_target, context);
           return mutex(agent.pane_id).runExclusive(async () => {
             context.abortSignal?.throwIfAborted();
             const current = await get(client, agent.pane_id, context);

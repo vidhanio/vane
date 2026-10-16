@@ -11,7 +11,9 @@ export const pathSchema = z
 
 /** Configuration shared by every platform, owned by the bot. */
 export const botConfigSchema = z.strictObject({
-  state_dir: pathSchema.default(join(homedir(), ".local/state/vidhan-bot")),
+  state_dir: pathSchema.default(
+    join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "vane"),
+  ),
   herdr_socket: pathSchema.default(
     process.env.HERDR_SOCKET_PATH ??
       join(

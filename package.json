@@ -1,9 +1,9 @@
 {
-  "name": "vidhan-bot",
+  "name": "vane",
   "version": "0.1.0",
   "private": true,
   "bin": {
-    "vidhan-bot": "./src/cli.ts"
+    "vane": "./src/cli.ts"
   },
   "type": "module",
   "scripts": {

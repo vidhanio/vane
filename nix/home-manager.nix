@@ -6,17 +6,17 @@ self:
   ...
 }:
 let
-  cfg = config.services.vidhan-bot;
+  cfg = config.services.vane;
   toml = pkgs.formats.toml { };
-  configFile = toml.generate "vidhan-bot-config.toml" cfg.settings;
+  configFile = toml.generate "vane-config.toml" cfg.settings;
 in
 {
-  options.services.vidhan-bot = {
-    enable = lib.mkEnableOption "vidhan-bot";
+  options.services.vane = {
+    enable = lib.mkEnableOption "vane";
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      description = "vidhan-bot package.";
+      description = "vane package.";
     };
     settings = lib.mkOption {
       inherit (toml) type;
@@ -36,10 +36,10 @@ in
   };
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
-    xdg.configFile."vidhan-bot/config.toml".source = configFile;
-    systemd.user.services.vidhan-bot = {
+    xdg.configFile."vane/config.toml".source = configFile;
+    systemd.user.services.vane = {
       Unit = {
-        Description = "vidhan-bot";
+        Description = "vane";
         After = [
           "network-online.target"
           "graphical-session.target"
@@ -52,7 +52,7 @@ in
         WorkingDirectory = config.home.homeDirectory;
         Environment = [
           "PATH=${lib.makeBinPath cfg.extraPackages}:/run/current-system/sw/bin:${config.home.profileDirectory}/bin"
-          "VIDHAN_BOT_CONFIG=${configFile}"
+          "VANE_CONFIG=${configFile}"
         ];
         Restart = "on-failure";
         RestartSec = 5;
