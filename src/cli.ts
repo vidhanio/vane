@@ -21,7 +21,7 @@ function platforms(config: BotConfig, bot: Bot): Discord[] {
   return entries.map(([name, raw]) => {
     if (name !== "discord") throw new Error(`Unknown platform: ${name}`);
     try {
-      return new Discord(bot, raw);
+      return new Discord(bot, raw, join(config.state_dir, "attachments", "discord"));
     } catch (error) {
       throw new Error(`Invalid [platforms.${name}] configuration`, { cause: error });
     }

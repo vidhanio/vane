@@ -1,3 +1,4 @@
+export type { Reply, ReplyAttachment } from "./attachments.ts";
 export { Bot } from "./bot.ts";
 export {
   botConfigSchema,

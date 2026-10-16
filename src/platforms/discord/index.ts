@@ -16,6 +16,7 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  HTTPError,
   InteractionContextType,
   MessageFlags,
   Partials,
@@ -29,6 +30,7 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
+import type { Reply } from "../../attachments.ts";
 import type { Bot } from "../../bot.ts";
 import { log } from "../../log.ts";
 import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../../session.ts";
@@ -46,7 +48,7 @@ const commands = (
     ["stop", "stop the current response and cancel queued messages"],
     ["status", "show the shared session's activity, model and usage"],
     ["tools", "toggle keeping tool-call messages after responses"],
-    ["reset", "cancel all work and reset the shared session"],
+    ["new", "cancel all work and start a new shared session"],
   ] as const
 ).map(([name, description]) =>
   new SlashCommandBuilder()
@@ -71,6 +73,7 @@ export class Discord implements DirectMessageIntegration {
   constructor(
     private readonly bot: Bot,
     config: unknown,
+    private readonly attachmentDirectory: string,
   ) {
     this.config = configSchema.parse(config);
   }
@@ -93,13 +96,13 @@ export class Discord implements DirectMessageIntegration {
         this.bot.session
           .submit(
             { platform: this.name, channelId: message.channelId, messageId: message.id },
-            (signal) => messageContent(message, signal),
+            (signal) => messageContent(message, signal, this.attachmentDirectory),
           )
           .catch(async (error: unknown) => {
             console.error("Discord submission failed", error);
             await this.reply(
               { platform: this.name, channelId: message.channelId, messageId: message.id },
-              errorText(error),
+              { text: errorText(error) },
               `submission:${message.id}:error`,
             );
           }),
@@ -189,17 +192,42 @@ export class Discord implements DirectMessageIntegration {
     }
   }
 
-  async reply(origin: MessageOrigin, text: string, key: string): Promise<void> {
+  async reply(origin: MessageOrigin, message: Reply, key: string): Promise<void> {
     const channel = await this.channel(origin.channelId);
-    for (const [index, content] of splitMessages(text).entries()) {
-      await channel.send({
-        content,
-        ...(index === 0
-          ? { reply: { messageReference: origin.messageId, failIfNotExists: false } }
-          : {}),
-        nonce: nonce(`${key}:${index}`),
-        enforceNonce: true,
-      });
+    const parts = splitMessages(message.text);
+    if (!parts.length && !message.attachments?.length) return;
+    if (!parts.length) parts.push("");
+    for (const [index, content] of parts.entries()) {
+      const files = index === 0 ? message.attachments : undefined;
+      try {
+        await channel.send({
+          ...(content ? { content } : {}),
+          ...(files?.length
+            ? { files: files.map((file) => ({ attachment: file.data, name: file.name })) }
+            : {}),
+          ...(index === 0
+            ? { reply: { messageReference: origin.messageId, failIfNotExists: false } }
+            : {}),
+          nonce: nonce(`${key}:${index}`),
+          enforceNonce: true,
+        });
+      } catch (error) {
+        if (
+          !files?.length ||
+          !(error instanceof DiscordAPIError || error instanceof HTTPError) ||
+          error.status < 400 ||
+          error.status >= 500 ||
+          error.status === 429
+        )
+          throw error;
+        console.error("Discord attachment upload failed", error);
+        await this.reply(
+          origin,
+          { text: `Attachment upload failed. Please try again.\n\n${message.text}`.trim() },
+          `${key}:attachment-error`,
+        );
+        return;
+      }
     }
   }
 
@@ -269,9 +297,9 @@ export class Discord implements DirectMessageIntegration {
           await this.bot.session.stop();
           await interaction.editReply("Response stopped; queued messages cancelled.");
           break;
-        case "reset":
+        case "new":
           await this.bot.session.reset();
-          await interaction.editReply("Shared session reset.");
+          await interaction.editReply("Started a new shared session.");
           break;
         case "tools":
           await interaction.editReply(

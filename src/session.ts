@@ -15,6 +15,7 @@ import {
   type UserInput,
 } from "@earendil-works/pi-durable";
 import { setTimeout as delay } from "node:timers/promises";
+import { prepareReply, type Reply } from "./attachments.ts";
 import { AgentNotification } from "./notifications.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -32,7 +33,7 @@ export interface DirectMessageIntegration {
     key: string,
   ): Promise<string[]>;
   removeProgress(origin: MessageOrigin, ids: string[]): Promise<void>;
-  reply(origin: MessageOrigin, text: string, key: string): Promise<void>;
+  reply(origin: MessageOrigin, message: Reply, key: string): Promise<void>;
 }
 
 const DirectMessage = defineEntry<MessageOrigin>("vane.message");
@@ -356,15 +357,17 @@ export class Session {
               message.role === "assistant" ? [contentText(message.content)] : [],
             )
             .join("\n");
-          await integration.reply(
-            origin,
+          const agent = await this.conversation.agent(context);
+          const reply = await prepareReply(
             text || "Completed with no text response.",
-            `${key}:answer`,
+            agent.cwd ?? process.cwd(),
+            this.shutdown.signal,
           );
+          await integration.reply(origin, reply, `${key}:answer`);
         } else if (result.reason !== "aborted") {
           await integration.reply(
             origin,
-            `Session ended without an answer: ${result.reason}.`,
+            { text: `Session ended without an answer: ${result.reason}.` },
             `${key}:answer`,
           );
         }
