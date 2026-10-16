@@ -4,3 +4,4 @@
 - Do not add or modify tests unless explicitly asked.
 - Do not write backwards compatibility code. This project is in development.
 - Do not update `README.md` unless explicitly asked.
+- When you need pi-durable usage examples, consult its [`packages/durable/test/examples` directory](https://github.com/earendil-works/pi/tree/main/packages/durable/test/examples).
