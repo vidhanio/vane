@@ -61,7 +61,7 @@ async function main(): Promise<void> {
     );
     await waitForShutdown(bot);
   } finally {
-    await Promise.allSettled(enabled.map((platform) => platform.stop()));
+    await Promise.allSettled([...enabled.map((platform) => platform.stop()), bot.session.close()]);
     try {
       await bot.close();
     } finally {

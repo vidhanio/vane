@@ -329,8 +329,6 @@ function inline(value: unknown): string {
 
 function toolText(call: ToolActivity): string {
   const args = call.arguments;
-  if (call.name === "codemode")
-    return codeBlock("js", codeText(typeof args.code === "string" ? args.code : ""));
   const parsed = z
     .object({ agent: z.string().optional(), workspace: z.string().optional() })
     .safeParse(call.details);

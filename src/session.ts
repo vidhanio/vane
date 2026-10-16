@@ -154,14 +154,11 @@ export class Session {
 
   private async finish(): Promise<void> {
     this.setTyping(undefined);
-    this.cancelPreparation();
-    await this.incoming;
-    await this.conversation.abort(context, { background: true });
-    this.closed = true;
     this.shutdown.abort();
     this.view.dispose();
-    await this.work;
-    await this.deliver();
+    this.cancelPreparation();
+    await Promise.all([this.incoming, this.work]);
+    this.closed = true;
   }
 
   private cancelPreparation(): void {
@@ -229,12 +226,12 @@ export class Session {
   }
 
   private refresh(): void {
-    if (this.closed) return;
+    if (this.shutdown.signal.aborted) return;
     this.dirty = true;
     if (this.refreshing) return;
     this.refreshing = true;
     this.work = (async () => {
-      while (this.dirty && !this.closed) {
+      while (this.dirty && !this.shutdown.signal.aborted) {
         this.dirty = false;
         try {
           await delay(Math.max(0, 750 - (Date.now() - this.updatedAt)), undefined, {
@@ -243,7 +240,7 @@ export class Session {
           await this.deliver();
           this.updatedAt = Date.now();
         } catch (error) {
-          if (this.closed) return;
+          if (this.shutdown.signal.aborted) return;
           console.error("Session delivery failed", error);
           if (error instanceof SessionFailed) {
             this.setTyping(undefined);
@@ -265,6 +262,7 @@ export class Session {
   }
 
   private async deliver(): Promise<void> {
+    if (this.shutdown.signal.aborted) return;
     let cursor: Cursor | undefined;
     do {
       const page = await this.conversation.entries(
@@ -279,6 +277,7 @@ export class Session {
         context,
       );
       for (const input of page.items) {
+        if (this.shutdown.signal.aborted) return;
         if (
           (!DirectMessage.is(input) && !AgentNotification.is(input)) ||
           (this.delivery.lastHandledInput !== undefined &&
@@ -306,6 +305,7 @@ export class Session {
             ),
           context,
         );
+        if (this.shutdown.signal.aborted) return;
         if (!result || result.type !== "input")
           throw new Error(`Missing submission for input ${input.id}`);
         const key = `${this.conversation.id}:${input.id}`;
