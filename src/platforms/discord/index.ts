@@ -29,11 +29,11 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
-import type { Bot } from "../bot.ts";
-import { log } from "../log.ts";
-import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../session.ts";
-import { messageContent } from "./discord-content.ts";
-import { splitMessages } from "./discord-text.ts";
+import type { Bot } from "../../bot.ts";
+import { log } from "../../log.ts";
+import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../../session.ts";
+import { messageContent } from "./content.ts";
+import { splitMessages } from "./text.ts";
 
 const context = BACKGROUND_CONTEXT;
 const configSchema = z.strictObject({
@@ -363,6 +363,9 @@ function toolText(call: ToolActivity): string {
       break;
     case "herdr_create_agent":
       text = `creating agent ${agent}${location}`;
+      break;
+    case "herdr_delete_agent":
+      text = `deleting agent pane ${agent}${location}`;
       break;
     case "herdr_delegate":
       text = `delegating to ${agent}${location}`;

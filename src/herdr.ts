@@ -441,6 +441,61 @@ export function herdrIntegration(config: BotConfig) {
         },
       }),
       defineTool({
+        name: "herdr_delete_agent",
+        description:
+          "Permanently close a Herdr pane and terminate its agent and other running processes. Accepts a live agent name or an explicit pane_id, including a pane with no live agent. Destructive: ask the user for confirmation before calling. Does not delete project files or worktrees. Inspect state before retrying an uncertain close.",
+        parameters: Type.Object(
+          {
+            agent_target: Type.String({
+              minLength: 1,
+              description: "Live agent name or exact pane_id to close; not a workspace or tab ID.",
+            }),
+          },
+          strict,
+        ),
+        execute: async (args, api, context) => {
+          let paneId: string;
+          let name: string | null = null;
+          let terminal: string | undefined;
+          try {
+            const agent = await get(client, args.agent_target, context);
+            paneId = agent.pane_id;
+            name = agent.name;
+            terminal = agent.terminal_id;
+          } catch (error) {
+            context.abortSignal?.throwIfAborted();
+            if (!(error instanceof HerdrError) || error.code !== "agent_not_found") throw error;
+            paneId = args.agent_target;
+          }
+          return mutex(paneId).runExclusive(async () => {
+            context.abortSignal?.throwIfAborted();
+            const { pane } = z
+              .object({
+                pane: z.object({
+                  pane_id: z.string(),
+                  workspace_id: z.string(),
+                  terminal_id: z.string(),
+                }),
+              })
+              .parse(await client.request("pane.get", { pane_id: paneId }, context));
+            if (terminal !== undefined && pane.terminal_id !== terminal)
+              throw new Error("Worker was replaced before deletion; no pane was closed");
+            await api.details(
+              {
+                agent: name ?? pane.pane_id,
+                workspace: await workspaceName(pane.workspace_id, context),
+              },
+              context,
+            );
+            return {
+              output: content(
+                await client.request("pane.close", { pane_id: pane.pane_id }, context),
+              ),
+            };
+          });
+        },
+      }),
+      defineTool({
         name: "herdr_read",
         description:
           "Read a Herdr agent's current status and terminal output without sending input. Use to check existing work, blockers, or uncertain submissions before considering another delegation.",

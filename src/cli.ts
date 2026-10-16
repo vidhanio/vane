@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Bot } from "./bot.ts";
 import { loadConfig, type BotConfig } from "./config.ts";
-import { Discord } from "./platforms/discord.ts";
+import { Discord } from "./platforms/discord/index.ts";
 import { log } from "./log.ts";
 
 function configPath(): string {

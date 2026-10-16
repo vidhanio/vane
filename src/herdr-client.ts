@@ -19,6 +19,8 @@ interface Methods {
   "workspace.list": Record<string, never>;
   "workspace.create": { cwd: string; label: string; focus: false };
   "pane.list": { workspace_id: string };
+  "pane.get": { pane_id: string };
+  "pane.close": { pane_id: string };
   "tab.create": { workspace_id: string; cwd: string; label: string; focus: false };
 }
 

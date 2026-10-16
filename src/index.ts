@@ -6,7 +6,7 @@ export {
   validateBotConfig,
   type BotConfig,
 } from "./config.ts";
-export { Discord } from "./platforms/discord.ts";
+export { Discord } from "./platforms/discord/index.ts";
 export {
   Session,
   type DirectMessageIntegration,

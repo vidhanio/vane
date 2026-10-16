@@ -1,7 +1,7 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { UserInput } from "@earendil-works/pi-durable";
 import type { Attachment, Message } from "discord.js";
-import { log } from "../log.ts";
+import { log } from "../../log.ts";
 
 const imageLimit = 10 * 1024 * 1024;
 const imageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
