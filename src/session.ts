@@ -24,20 +24,21 @@ export type ToolActivity = Pick<ToolCall, "id" | "name" | "arguments"> & { detai
 
 export interface DirectMessageIntegration {
   readonly name: string;
+  setTyping(origin: MessageOrigin | undefined): void;
   progress(
     origin: MessageOrigin,
     calls: ToolActivity[],
-    id: string | undefined,
+    ids: string[],
     key: string,
-  ): Promise<string>;
-  removeProgress(origin: MessageOrigin, id: string): Promise<void>;
+  ): Promise<string[]>;
+  removeProgress(origin: MessageOrigin, ids: string[]): Promise<void>;
   reply(origin: MessageOrigin, text: string, key: string): Promise<void>;
 }
 
 const DirectMessage = defineEntry<MessageOrigin>("vane.message");
 const requestId = (origin: MessageOrigin) =>
   `${origin.platform}:${origin.channelId}:${origin.messageId}`;
-type DeliveryState = { lastHandledInput?: EntryId; progressId?: string };
+type DeliveryState = { lastHandledInput?: EntryId; progressIds?: string[] };
 const Delivery = defineDoc<DeliveryState>({
   kind: "vane.delivery",
   version: 1,
@@ -132,6 +133,7 @@ export class Session {
   }
 
   private async finish(): Promise<void> {
+    this.setTyping(undefined);
     this.cancelPreparation();
     await this.incoming;
     await this.conversation.abort(context, { background: true });
@@ -220,7 +222,10 @@ export class Session {
         } catch (error) {
           if (this.closed) return;
           console.error("Session delivery failed", error);
-          if (error instanceof SessionFailed) return;
+          if (error instanceof SessionFailed) {
+            this.setTyping(undefined);
+            return;
+          }
           this.dirty = true;
           await delay(5000, undefined, { signal: this.shutdown.signal }).catch(() => undefined);
         }
@@ -228,6 +233,12 @@ export class Session {
     })().finally(() => {
       this.refreshing = false;
     });
+  }
+
+  private setTyping(origin: MessageOrigin | undefined): void {
+    if (this.closed || this.closing) origin = undefined;
+    for (const integration of this.integrations.values())
+      integration.setTyping(integration.name === origin?.platform ? origin : undefined);
   }
 
   private async deliver(): Promise<void> {
@@ -260,7 +271,10 @@ export class Session {
           throw new Error(`Missing message origin for input ${input.id}`);
         const origin = source.data;
         const integration = this.integrations.get(origin.platform);
-        if (!integration) return;
+        if (!integration) {
+          this.setTyping(undefined);
+          return;
+        }
         const result = await this.conversation.commit(
           (tx) =>
             tx.submissionByRequest(
@@ -273,29 +287,36 @@ export class Session {
           throw new Error(`Missing submission for input ${input.id}`);
         const key = `${this.conversation.id}:${input.id}`;
         if (result.status === "placed" || result.status === "queued") {
+          this.setTyping(origin);
           const calls = [...(this.tools.get(input.id)?.values() ?? [])];
           if (calls.length) {
-            const id = await integration.progress(
+            const ids = await integration.progress(
               origin,
               calls,
-              this.delivery.progressId,
+              this.delivery.progressIds ?? [],
               `${key}:tools`,
             );
-            if (id !== this.delivery.progressId) {
+            if (
+              ids.length !== this.delivery.progressIds?.length ||
+              ids.some((id, index) => id !== this.delivery.progressIds?.[index])
+            ) {
               await this.conversation.commit(async (tx) => {
-                (await tx.doc(Delivery, this.conversation.id)).progressId = id;
+                (await tx.doc(Delivery, this.conversation.id)).progressIds = ids;
               }, context);
-              this.delivery.progressId = id;
+              this.delivery.progressIds = ids;
             }
           }
           return;
         }
-        if (this.delivery.progressId) {
-          await integration.removeProgress(origin, this.delivery.progressId);
+        this.setTyping(
+          result.status === "done" || result.reason !== "aborted" ? origin : undefined,
+        );
+        if (this.delivery.progressIds) {
+          await integration.removeProgress(origin, this.delivery.progressIds);
           await this.conversation.commit(async (tx) => {
-            delete (await tx.doc(Delivery, this.conversation.id)).progressId;
+            delete (await tx.doc(Delivery, this.conversation.id)).progressIds;
           }, context);
-          delete this.delivery.progressId;
+          delete this.delivery.progressIds;
         }
         if (result.status === "done") {
           const answer = await this.conversation.commit(
@@ -320,6 +341,7 @@ export class Session {
             `${key}:answer`,
           );
         }
+        this.setTyping(undefined);
         await this.conversation.commit(async (tx) => {
           (await tx.doc(Delivery, this.conversation.id)).lastHandledInput = input.id;
         }, context);
@@ -328,5 +350,6 @@ export class Session {
       }
       cursor = page.next;
     } while (cursor);
+    this.setTyping(undefined);
   }
 }

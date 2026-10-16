@@ -8,7 +8,6 @@ import {
   type UsageState,
 } from "@earendil-works/pi-durable";
 import {
-  AttachmentBuilder,
   ChannelType,
   Client,
   codeBlock,
@@ -27,12 +26,14 @@ import {
   type Message,
 } from "discord.js";
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Bot } from "../bot.ts";
 import { log } from "../log.ts";
 import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../session.ts";
 import { messageContent } from "./discord-content.ts";
+import { splitMessages } from "./discord-text.ts";
 
 const context = BACKGROUND_CONTEXT;
 const configSchema = z.strictObject({
@@ -64,6 +65,7 @@ export class Discord implements DirectMessageIntegration {
   private stopping = true;
   private readonly running = new Set<Promise<void>>();
   private readonly progressText = new Map<string, string>();
+  private typing: { channelId: string; controller: AbortController } | undefined;
 
   constructor(
     private readonly bot: Bot,
@@ -94,7 +96,11 @@ export class Discord implements DirectMessageIntegration {
           )
           .catch(async (error: unknown) => {
             console.error("Discord submission failed", error);
-            await message.reply(responseOptions(errorText(error)));
+            await this.reply(
+              { platform: this.name, channelId: message.channelId, messageId: message.id },
+              errorText(error),
+              `submission:${message.id}:error`,
+            );
           }),
       );
     });
@@ -106,73 +112,134 @@ export class Discord implements DirectMessageIntegration {
     await ready;
     if (!this.client.application) throw new Error("Discord application is unavailable");
     await this.client.application.commands.set(commands.map((command) => command.toJSON()));
-    this.bot.session.connect(this);
     this.stopping = false;
+    this.bot.session.connect(this);
     log("discord.connected", { userId: this.client.user?.id });
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.updateTyping(undefined);
     await Promise.allSettled(this.running);
   }
 
   async close(): Promise<void> {
+    this.stopping = true;
+    this.updateTyping(undefined);
     await this.client.destroy();
     log("discord.disconnected");
+  }
+
+  setTyping(origin: MessageOrigin | undefined): void {
+    this.updateTyping(this.stopping ? undefined : origin?.channelId);
   }
 
   async progress(
     origin: MessageOrigin,
     calls: ToolActivity[],
-    id: string | undefined,
+    ids: string[],
     key: string,
-  ): Promise<string> {
-    const channel = await this.channel(origin);
-    const text = calls.map(toolText).join("\n");
-    if (id && this.progressText.get(id) === text) return id;
-    const options = responseOptions(text, "tool-calls.md");
-    let message: Message | undefined;
-    if (id) {
-      try {
-        message = await channel.messages.edit(id, options);
-      } catch (error) {
-        if (!unknownMessage(error)) throw error;
-        this.progressText.delete(id);
+  ): Promise<string[]> {
+    const channel = await this.channel(origin.channelId);
+    const parts = splitMessages(calls.map(toolText).join("\n"));
+    const updated: string[] = [];
+    for (const [index, content] of parts.entries()) {
+      const id = ids[index];
+      if (id && this.progressText.get(id) === content) {
+        updated.push(id);
+        continue;
       }
+      let message: Message | undefined;
+      if (id) {
+        try {
+          message = await channel.messages.edit(id, { content });
+        } catch (error) {
+          if (!unknownMessage(error)) throw error;
+          this.progressText.delete(id);
+        }
+      }
+      if (!message) {
+        message = await channel.send({
+          content,
+          nonce: nonce(`${key}:${index}`),
+          enforceNonce: true,
+        });
+        if (message.content !== content)
+          message = await channel.messages.edit(message.id, { content });
+        this.refreshTyping();
+      }
+      this.progressText.set(message.id, content);
+      updated.push(message.id);
     }
-    message ??= await channel.send({ ...options, nonce: nonce(key), enforceNonce: true });
-    this.progressText.set(message.id, text);
-    return message.id;
+    await this.removeProgress(origin, ids.slice(parts.length));
+    return updated;
   }
 
-  async removeProgress(origin: MessageOrigin, id: string): Promise<void> {
-    const channel = await this.channel(origin);
-    try {
-      await channel.messages.delete(id);
-    } catch (error) {
-      if (!unknownMessage(error)) throw error;
+  async removeProgress(origin: MessageOrigin, ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    const channel = await this.channel(origin.channelId);
+    for (const id of ids) {
+      try {
+        await channel.messages.delete(id);
+      } catch (error) {
+        if (!unknownMessage(error)) throw error;
+      }
+      this.progressText.delete(id);
     }
-    this.progressText.delete(id);
   }
 
   async reply(origin: MessageOrigin, text: string, key: string): Promise<void> {
-    const channel = await this.channel(origin);
-    await channel.send({
-      ...responseOptions(text),
-      reply: { messageReference: origin.messageId, failIfNotExists: false },
-      nonce: nonce(key),
-      enforceNonce: true,
-    });
+    const channel = await this.channel(origin.channelId);
+    for (const [index, content] of splitMessages(text).entries()) {
+      await channel.send({
+        content,
+        ...(index === 0
+          ? { reply: { messageReference: origin.messageId, failIfNotExists: false } }
+          : {}),
+        nonce: nonce(`${key}:${index}`),
+        enforceNonce: true,
+      });
+    }
   }
 
-  private async channel(origin: MessageOrigin): Promise<DMChannel | PartialDMChannel> {
-    const channel = await this.client.channels.fetch(origin.channelId);
+  private updateTyping(channelId: string | undefined): void {
+    if (channelId === this.typing?.channelId) return;
+    this.typing?.controller.abort();
+    this.typing = undefined;
+    if (!channelId) return;
+    const controller = new AbortController();
+    this.typing = { channelId, controller };
+    void this.runTyping(channelId, controller.signal);
+  }
+
+  private refreshTyping(): void {
+    const channelId = this.typing?.channelId;
+    if (!channelId) return;
+    this.updateTyping(undefined);
+    this.updateTyping(channelId);
+  }
+
+  private async runTyping(channelId: string, signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        const channel = await this.channel(channelId);
+        if (!signal.aborted) await channel.sendTyping();
+      } catch (error) {
+        if (!signal.aborted) console.error("Discord typing failed", { channelId, error });
+      }
+      if (signal.aborted) return;
+      await delay(8000, undefined, { signal }).catch(() => undefined);
+    }
+  }
+
+  private async channel(channelId: string): Promise<DMChannel | PartialDMChannel> {
+    const channel = await this.client.channels.fetch(channelId);
     if (
       channel?.type !== ChannelType.DM ||
       !channel.recipient ||
       !this.config.allowed_user_ids.includes(channel.recipient.id)
     )
-      throw new Error(`Discord DM is unavailable: ${origin.channelId}`);
+      throw new Error(`Discord DM is unavailable: ${channelId}`);
     return channel;
   }
 
@@ -220,7 +287,10 @@ export class Discord implements DirectMessageIntegration {
       }
     } catch (error) {
       console.error(`Discord command ${interaction.commandName} failed`, error);
-      await interaction.editReply(errorText(error));
+      const [first, ...rest] = splitMessages(errorText(error));
+      await interaction.editReply(first ?? "An unknown error occurred.");
+      for (const content of rest)
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
     }
   }
 }
@@ -231,12 +301,6 @@ function nonce(key: string): string {
 
 function unknownMessage(error: unknown): boolean {
   return error instanceof DiscordAPIError && error.code === 10008;
-}
-
-function responseOptions(text: string, name = "response.md") {
-  return text.length <= 2000
-    ? { content: text, files: [], attachments: [] }
-    : { content: "", files: [new AttachmentBuilder(Buffer.from(text), { name })], attachments: [] };
 }
 
 function codeText(text: string): string {
