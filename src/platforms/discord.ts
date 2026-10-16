@@ -3,7 +3,6 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   contentText,
   type ImageContent,
-  type JsonObject,
   type TextContent,
   type ToolCall,
 } from "@earendil-works/pi-ai";
@@ -55,6 +54,7 @@ import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Bot } from "../bot.ts";
 import { log } from "../log.ts";
+import { AgentNotification } from "../notifications.ts";
 
 const context = BACKGROUND_CONTEXT;
 const snowflake = z.string().regex(/^\d{17,20}$/);
@@ -526,19 +526,34 @@ export class DiscordConversation {
       const page = await this.conversation.entries(query, 100, cursor, context);
       for (const input of page.items) {
         if (
-          (!DiscordMessage.is(input) && !DiscordDMMessage.is(input)) ||
+          (!DiscordMessage.is(input) &&
+            !DiscordDMMessage.is(input) &&
+            !AgentNotification.is(input)) ||
           (this.delivery.lastHandledInput !== undefined &&
             input.id <= this.delivery.lastHandledInput)
         )
           continue;
-        const messageId = DiscordDMMessage.is(input) ? input.data.messageId : input.data;
-        const thread = DiscordDMMessage.is(input)
-          ? await this.thread.client.channels.fetch(input.data.channelId)
+        const originId = AgentNotification.is(input) ? input.data.origin : undefined;
+        const origin =
+          originId === undefined
+            ? input
+            : await this.conversation.commit((tx) => tx.entry(originId), context);
+        const source = origin ?? input;
+        const messageId = DiscordDMMessage.is(source)
+          ? source.data.messageId
+          : DiscordMessage.is(source)
+            ? source.data
+            : String(input.id);
+        const thread = DiscordDMMessage.is(source)
+          ? await this.thread.client.channels.fetch(source.data.channelId)
           : this.thread;
+        const submissionRequestId = AgentNotification.is(input)
+          ? input.data.requestId
+          : requestId(messageId);
         if (!thread || (thread.type !== ChannelType.DM && !thread.isThread()))
           throw new Error(`Missing Discord channel for input ${messageId}`);
         const result = await this.conversation.commit(
-          (tx) => tx.submissionByRequest(this.conversation.id, requestId(messageId)),
+          (tx) => tx.submissionByRequest(this.conversation.id, submissionRequestId),
           context,
         );
         if (!result || result.type !== "input")
@@ -666,43 +681,98 @@ function errorText(error: unknown): string {
   return `ERROR:\n${codeBlock(codeText(message).toWellFormed())}`;
 }
 
-function detailText(name: string, args: JsonObject): string {
-  if (name === "bash") return typeof args.command === "string" ? args.command : "";
-  if (name === "read" || name === "write" || name === "edit")
-    return typeof args.path === "string" ? args.path : "";
-  if (name.startsWith("herdr_")) {
-    const target = args.agent ?? args.name;
-    return typeof target === "string" ? target : "";
+function clipped(text: string, limit: number): string {
+  return (
+    text.length > limit ? `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…` : text
+  ).toWellFormed();
+}
+
+function inline(value: unknown, limit = Infinity): string {
+  return `\`${clipped(
+    stripVTControlCharacters(typeof value === "string" ? value : "")
+      .replaceAll("`", "")
+      .replace(/\s+/g, " ")
+      .trim(),
+    limit,
+  )}\``;
+}
+
+function toolText(call: Pick<ToolCall, "name" | "arguments">, details: unknown): string {
+  const args = call.arguments;
+  if (call.name === "codemode") {
+    const code = typeof args.code === "string" ? args.code : "";
+    return codeBlock("js", codeText(code).toWellFormed());
   }
-  return "";
+  const parsed = z
+    .object({ agent: z.string().optional(), workspace: z.string().optional() })
+    .safeParse(details);
+  const agent = inline(
+    parsed.success ? (parsed.data.agent ?? args.agent ?? args.name) : (args.agent ?? args.name),
+  );
+  const workspace = parsed.success ? (parsed.data.workspace ?? args.workspace) : args.workspace;
+  const location = typeof workspace === "string" ? ` in ${inline(workspace)}` : "";
+  let text: string;
+  switch (call.name) {
+    case "read":
+      text = `reading ${inline(args.path)}`;
+      break;
+    case "edit":
+      text = `editing ${inline(args.path)}`;
+      break;
+    case "write":
+      text = `writing ${inline(args.path)}`;
+      break;
+    case "bash":
+      text = `running ${inline(args.command, 80)}`;
+      break;
+    case "herdr_list":
+      text = "getting herdr status";
+      break;
+    case "herdr_create_workspace":
+      text = `creating workspace ${inline(args.name)} at ${inline(args.project)}`;
+      break;
+    case "herdr_create_agent":
+      text = `creating agent ${agent}${location}`;
+      break;
+    case "herdr_delegate":
+      text = `delegating to ${agent}${location}`;
+      break;
+    case "herdr_subscribe":
+      text = `subscribing to ${agent}${location}`;
+      break;
+    case "herdr_read":
+      text = `reading status of ${agent}${location}`;
+      break;
+    default:
+      text = `using ${inline(call.name)}`;
+  }
+  return `-# ${text}`;
 }
 
 function renderToolLog(view: ConversationView, input: EntryId): string {
-  const calls: ToolCall[] = [];
+  const calls: Pick<ToolCall, "id" | "name" | "arguments">[] = [];
+  const details = new Map<string, unknown>();
+  const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
+  for (const slot of live?.tools ?? []) details.set(slot.callId, slot.details);
+  for (const slot of live?.nestedTools ?? []) details.set(slot.callId, slot.details);
   for (const entry of view.entries) {
     if (entry.id < input) continue;
     for (const message of entry.model ?? []) {
+      if (message.role === "toolResult") details.set(message.toolCallId, message.details);
       if (message.role === "assistant")
-        for (const block of message.content) if (block.type === "toolCall") calls.push(block);
+        for (const block of message.content) {
+          if (block.type !== "toolCall") continue;
+          calls.push(block);
+          for (const slot of (live?.nestedTools ?? [])
+            .filter((nested) => nested.parentCallId === block.id)
+            .slice(-3))
+            calls.push({ id: slot.callId, name: slot.name, arguments: slot.arguments });
+        }
     }
   }
   return calls
     .slice(-10)
-    .map((call) => {
-      const name = call.name.replaceAll("`", "").replace(/\s+/g, " ").slice(0, 140).toWellFormed();
-      const args = detailText(call.name, call.arguments)
-        .replaceAll("`", "")
-        .replace(/\s+/g, " ")
-        .trim();
-      const limit = Math.max(
-        0,
-        Math.min(call.name === "bash" ? 50 : Infinity, 140 - name.length - 1),
-      );
-      const detail = (
-        args.length > limit ? `${args.slice(0, Math.max(0, limit - 1)).trimEnd()}…` : args
-      ).toWellFormed();
-      return `-# **\`${name}\`**${detail ? ` \`${detail}\`` : ""}`;
-    })
+    .map((call) => toolText(call, details.get(call.id)))
     .join("\n");
 }
 

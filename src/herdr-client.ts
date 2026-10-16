@@ -15,7 +15,7 @@ interface Methods {
     pane_id: string;
     timeout_ms: number;
   };
-  "agent.prompt": { target: string; text: string; wait: { timeout_ms: number } };
+  "agent.prompt": { target: string; text: string };
   "workspace.list": Record<string, never>;
   "workspace.create": { cwd: string; label: string; focus: false };
   "pane.list": { workspace_id: string };
