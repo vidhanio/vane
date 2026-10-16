@@ -48,6 +48,15 @@ const Delivery = defineDoc<DeliveryState>({
   initial: () => ({}),
 });
 
+const SessionSettings = defineDoc<{ showTools: boolean }>({
+  kind: "vane.session.settings",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ showTools: true }),
+});
+
 export class Session {
   private readonly integrations = new Map<string, DirectMessageIntegration>();
   private readonly tools = new Map<EntryId, Map<string, ToolActivity>>();
@@ -129,6 +138,16 @@ export class Session {
     });
   }
 
+  toggleTools(): Promise<boolean> {
+    return this.enqueue(() =>
+      this.conversation.commit(async (tx) => {
+        const settings = await tx.doc(SessionSettings, this.conversation.id);
+        settings.showTools = !settings.showTools;
+        return settings.showTools;
+      }, context),
+    );
+  }
+
   close(): Promise<void> {
     return (this.closing ??= this.finish());
   }
@@ -150,13 +169,16 @@ export class Session {
     this.preparation = new AbortController();
   }
 
-  private enqueue(action: () => Promise<void>): Promise<void> {
+  private enqueue<T>(action: () => Promise<T>): Promise<T> {
     if (this.closing) return Promise.reject(new Error("Session is closing"));
     const work = this.incoming.then(() => {
       if (this.closed) throw new Error("Session is closed");
       return action();
     });
-    this.incoming = work.catch(() => undefined);
+    this.incoming = work.then(
+      () => undefined,
+      () => undefined,
+    );
     return work;
   }
 
@@ -313,7 +335,11 @@ export class Session {
           result.status === "done" || result.reason !== "aborted" ? origin : undefined,
         );
         if (this.delivery.progressIds) {
-          await integration.removeProgress(origin, this.delivery.progressIds);
+          const showTools = await this.conversation.commit(
+            async (tx) => (await tx.doc(SessionSettings, this.conversation.id)).showTools,
+            context,
+          );
+          if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
           await this.conversation.commit(async (tx) => {
             delete (await tx.doc(Delivery, this.conversation.id)).progressIds;
           }, context);

@@ -33,7 +33,7 @@ import type { Bot } from "../bot.ts";
 import { log } from "../log.ts";
 import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../session.ts";
 import { messageContent } from "./discord-content.ts";
-import { splitMessages, windowMessage } from "./discord-text.ts";
+import { splitMessages } from "./discord-text.ts";
 
 const context = BACKGROUND_CONTEXT;
 const configSchema = z.strictObject({
@@ -43,9 +43,10 @@ const configSchema = z.strictObject({
 
 const commands = (
   [
-    ["stop", "Stop the current response and cancel queued messages"],
-    ["status", "Show the shared session's activity, model and usage"],
-    ["reset", "Cancel all work and reset the shared session"],
+    ["stop", "stop the current response and cancel queued messages"],
+    ["status", "show the shared session's activity, model and usage"],
+    ["tools", "toggle keeping tool-call messages after responses"],
+    ["reset", "cancel all work and reset the shared session"],
   ] as const
 ).map(([name, description]) =>
   new SlashCommandBuilder()
@@ -141,8 +142,7 @@ export class Discord implements DirectMessageIntegration {
     key: string,
   ): Promise<string[]> {
     const channel = await this.channel(origin.channelId);
-    const window = windowMessage(calls.map(toolText));
-    const parts = window ? [window] : [];
+    const parts = splitMessages(calls.map(toolText).join("\n"));
     const updated: string[] = [];
     for (const [index, content] of parts.entries()) {
       const id = ids[index];
@@ -272,6 +272,13 @@ export class Discord implements DirectMessageIntegration {
         case "reset":
           await this.bot.session.reset();
           await interaction.editReply("Shared session reset.");
+          break;
+        case "tools":
+          await interaction.editReply(
+            (await this.bot.session.toggleTools())
+              ? "Tools on: tool-call messages will stay in the channel."
+              : "Tools off: tool-call messages will be deleted before responses.",
+          );
           break;
         case "status":
           await interaction.editReply({

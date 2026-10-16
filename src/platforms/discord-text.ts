@@ -25,17 +25,6 @@ export function splitMessages(text: string): string[] {
   return messages;
 }
 
-export function windowMessage(lines: string[]): string {
-  let current = "";
-  for (const text of lines.toReversed()) {
-    if (!text || text.length > messageLimit) continue;
-    const next = current ? `${text}\n${current}` : text;
-    if (next.length > messageLimit) break;
-    current = next;
-  }
-  return current;
-}
-
 function blocks(text: string): Block[] {
   const result: Block[] = [];
   let plain = "";
