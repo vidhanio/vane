@@ -1,6 +1,8 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { configure, createRegistry, Harness } from "@earendil-works/pi-durable";
+import { CodemodeSandbox } from "@earendil-works/pi-codemode";
+import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
@@ -18,6 +20,7 @@ export class Bot {
   private constructor(
     readonly harness: Harness,
     private readonly release: () => Promise<void>,
+    private readonly sandbox: CodemodeSandbox,
   ) {}
 
   static async open(config: BotConfig): Promise<Bot> {
@@ -30,10 +33,20 @@ export class Bot {
     const release = await lock(config.state_dir, {
       retries: { retries: 5, minTimeout: 1000, maxTimeout: 3000 },
     });
+    let sandbox: CodemodeSandbox | undefined;
     try {
+      sandbox = new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 });
       const registry = createRegistry();
       registry.install(CodingTools);
       registry.install(botTools(config));
+      registry.install(
+        createCodemodeExtension({
+          sandbox,
+          namespaces: [
+            { name: "herdr", description: "Herdr workspaces and agents", prefix: "herdr_" },
+          ],
+        }),
+      );
       const storage = await openNodeJsonlStorage(join(config.state_dir, "sessions"), context, {
         fsync: true,
       });
@@ -65,9 +78,13 @@ export class Bot {
         provider: config.agent.provider,
         model: config.agent.model_id,
       });
-      return new Bot(harness, release);
+      return new Bot(harness, release, sandbox);
     } catch (error) {
-      await release();
+      try {
+        await sandbox?.close();
+      } finally {
+        await release();
+      }
       throw error;
     }
   }
@@ -76,7 +93,11 @@ export class Bot {
     try {
       await this.harness.close(context);
     } finally {
-      await this.release();
+      try {
+        await this.sandbox.close();
+      } finally {
+        await this.release();
+      }
     }
   }
 }
