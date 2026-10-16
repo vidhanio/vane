@@ -37,13 +37,19 @@ export class HerdrError extends Error {
 export class HerdrClient {
   constructor(readonly socketPath: string) {}
 
-  private async *exchange(method: string, params: object, context: Context, timeout: number) {
+  async request<K extends keyof Methods>(
+    method: K,
+    params: Methods[K],
+    context: Context,
+    timeout = 35_000,
+  ): Promise<unknown> {
     context.abortSignal?.throwIfAborted();
     const id = randomUUID();
-    const socket = createConnection({
-      path: this.socketPath,
-      ...(context.abortSignal ? { signal: context.abortSignal } : {}),
-    });
+    const responseSchema = z.union([
+      z.object({ id: z.literal(id), error: z.object({ code: z.string(), message: z.string() }) }),
+      z.object({ id: z.literal(id), result: z.unknown() }),
+    ]);
+    const socket = createConnection({ path: this.socketPath, signal: context.abortSignal });
     const lines = createInterface({ input: socket, crlfDelay: Infinity });
     let failure: Error | undefined;
     socket.on("error", (error) => {
@@ -59,15 +65,9 @@ export class HerdrClient {
       socket.write(`${JSON.stringify({ id, method, params })}\n`);
       for await (const line of lines) {
         if (line.length > 1_000_000) throw new Error("Herdr response exceeded 1 MB");
-        const frame: unknown = JSON.parse(line);
-        const responseId = z.object({ id: z.string() }).safeParse(frame);
-        if (responseId.success && responseId.data.id !== id)
-          throw new Error("Herdr response ID does not match the request");
-        const error = z
-          .object({ id: z.literal(id), error: z.object({ code: z.string(), message: z.string() }) })
-          .safeParse(frame);
-        if (error.success) throw new HerdrError(error.data.error.code, error.data.error.message);
-        yield frame;
+        const response = responseSchema.parse(JSON.parse(line));
+        if ("error" in response) throw new HerdrError(response.error.code, response.error.message);
+        return response.result;
       }
       throw failure ?? new Error("Herdr socket disconnected");
     } finally {
@@ -75,16 +75,5 @@ export class HerdrClient {
       lines.close();
       socket.destroy();
     }
-  }
-
-  async request<K extends keyof Methods>(
-    method: K,
-    params: Methods[K],
-    context: Context,
-    timeout = 35_000,
-  ): Promise<unknown> {
-    for await (const frame of this.exchange(method, params, context, timeout))
-      return z.object({ id: z.string(), result: z.unknown() }).parse(frame).result;
-    throw new Error("Herdr did not respond");
   }
 }

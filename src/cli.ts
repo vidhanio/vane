@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { Bot } from "./bot.ts";
 import { loadConfig, type BotConfig } from "./config.ts";
 import { Discord } from "./platforms/discord/index.ts";
+import type { Platform } from "./platforms/index.ts";
 import { log } from "./log.ts";
 
 function configPath(): string {
@@ -14,14 +15,14 @@ function configPath(): string {
   );
 }
 
-function platforms(config: BotConfig, bot: Bot): Discord[] {
+function platforms(config: BotConfig, bot: Bot): Platform[] {
   const entries = Object.entries(config.platforms);
   if (entries.length === 0)
     throw new Error("No platforms enabled; add a [platforms.<name>] table to the config");
   return entries.map(([name, raw]) => {
     if (name !== "discord") throw new Error(`Unknown platform: ${name}`);
     try {
-      return new Discord(bot, raw, join(config.state_dir, "attachments", "discord"));
+      return new Discord(bot.session, raw, join(config.state_dir, "attachments", "discord"));
     } catch (error) {
       throw new Error(`Invalid [platforms.${name}] configuration`, { cause: error });
     }
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
   process.umask(0o077);
   const config = await loadConfig(configPath());
   const bot = await Bot.open(config);
-  let enabled: Discord[] = [];
+  let enabled: Platform[] = [];
   try {
     enabled = platforms(config, bot);
     log("service.starting", { platforms: enabled.map((platform) => platform.name) });

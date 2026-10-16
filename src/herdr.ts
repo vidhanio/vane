@@ -7,6 +7,7 @@ import {
   type EntryId,
   type TaskId,
   type ToolExecutionApi,
+  type Tx,
 } from "@earendil-works/pi-durable";
 import { Mutex } from "async-mutex";
 import { stat } from "node:fs/promises";
@@ -15,7 +16,7 @@ import { z } from "zod";
 import { pathSchema, type BotConfig } from "./config.ts";
 import { content } from "./content.ts";
 import { HerdrClient, HerdrError } from "./herdr-client.ts";
-import { AgentNotification } from "./notifications.ts";
+import { AgentNotification, DirectMessage } from "./messages.ts";
 
 const strict = { additionalProperties: false };
 const agentTarget = Type.String({
@@ -56,11 +57,21 @@ type WatchInput = {
   baseline: number;
   requireStart: boolean;
   startedAt: number;
-  origin?: EntryId;
+  origin: EntryId;
 };
 type WatchState =
-  | { phase: "watch"; seenWorking: boolean; errors: number; polls: number }
-  | { phase: "notify"; message: string };
+  { phase: "watch"; seenWorking: boolean; errors: number } | { phase: "notify"; message: string };
+
+async function subscriptionKey(
+  tx: Tx,
+  pane: string,
+  terminal: string,
+  origin: EntryId,
+): Promise<string> {
+  const source = await tx.entry(DirectMessage, origin);
+  if (!source) throw new Error(`Missing message origin: ${origin}`);
+  return `${pane}:${terminal}:${source.data.platform}:${source.data.channelId}`;
+}
 
 async function get(
   client: HerdrClient,
@@ -149,13 +160,12 @@ async function start(client: HerdrClient, paneId: string, name: string, context:
       (current.interactive_ready &&
         (current.agent_status === "idle" || current.agent_status === "done"))
     ) {
-      const result = await report(client, current, context);
       if (current.agent_status === "blocked")
         throw new HerdrError(
           "agent_not_ready",
           `Agent ${name} is blocked during startup; ask the user before sending input`,
         );
-      return result;
+      return report(client, current, context);
     }
     if (
       (current.agent_status === "idle" || current.agent_status === "done") &&
@@ -198,7 +208,7 @@ export function herdrIntegration(config: BotConfig) {
   const Watcher = defineTask<WatchInput, WatchState, null>({
     name: "vane.herdr.watch",
     version: 1,
-    initial: () => ({ phase: "watch", seenWorking: false, errors: 0, polls: 0 }),
+    initial: () => ({ phase: "watch", seenWorking: false, errors: 0 }),
     phases: {
       watch: async (task, runtime, context) => {
         const input = task.input;
@@ -238,7 +248,7 @@ export function herdrIntegration(config: BotConfig) {
             status: "running",
             checkpoint:
               message === undefined
-                ? { phase: "watch", seenWorking, errors, polls: task.state.checkpoint.polls + 1 }
+                ? { phase: "watch", seenWorking, errors }
                 : { phase: "notify", message },
           }),
           context,
@@ -258,7 +268,7 @@ export function herdrIntegration(config: BotConfig) {
               kind: AgentNotification.kind,
               data: {
                 requestId,
-                ...(task.input.origin === undefined ? {} : { origin: task.input.origin }),
+                origin: task.input.origin,
               },
             },
           },
@@ -266,7 +276,12 @@ export function herdrIntegration(config: BotConfig) {
         );
         await runtime.commit(async (tx) => {
           const subscriptions = await tx.doc(Subscriptions, runtime.conversationId);
-          const key = `${task.input.pane}:${task.input.terminal}`;
+          const key = await subscriptionKey(
+            tx,
+            task.input.pane,
+            task.input.terminal,
+            task.input.origin,
+          );
           if (subscriptions.agents[key] === task.id) delete subscriptions.agents[key];
           return { status: "terminal", outcome: { status: "completed", result: null } };
         }, context);
@@ -275,7 +290,12 @@ export function herdrIntegration(config: BotConfig) {
     abort: (task, runtime, context) =>
       runtime.commit(async (tx) => {
         const subscriptions = await tx.doc(Subscriptions, runtime.conversationId);
-        const key = `${task.input.pane}:${task.input.terminal}`;
+        const key = await subscriptionKey(
+          tx,
+          task.input.pane,
+          task.input.terminal,
+          task.input.origin,
+        );
         if (subscriptions.agents[key] === task.id) delete subscriptions.agents[key];
         return { status: "terminal", outcome: { status: "aborted" } };
       }, context),
@@ -289,13 +309,6 @@ export function herdrIntegration(config: BotConfig) {
   ) =>
     api.commit(async (tx) => {
       const subscriptions = await tx.doc(Subscriptions, api.conversationId);
-      const key = `${agent.pane_id}:${agent.terminal_id}`;
-      const existing = subscriptions.agents[key];
-      if (!requireStart && existing) {
-        const task = await tx.task(existing);
-        if (task && task.state.status !== "terminal" && task.state.status !== "completing")
-          return existing;
-      }
       let origin: EntryId | undefined;
       let cursor;
       do {
@@ -304,8 +317,8 @@ export function herdrIntegration(config: BotConfig) {
           100,
           cursor,
         );
-        const input = page.items.find((entry) =>
-          entry.model?.some((message) => message.role === "user"),
+        const input = page.items.find(
+          (entry) => DirectMessage.is(entry) || AgentNotification.is(entry),
         );
         if (input) {
           origin = AgentNotification.is(input) ? input.data.origin : input.id;
@@ -313,6 +326,14 @@ export function herdrIntegration(config: BotConfig) {
         }
         cursor = page.next;
       } while (cursor);
+      if (origin === undefined) throw new Error("Cannot subscribe without a message origin");
+      const key = await subscriptionKey(tx, agent.pane_id, agent.terminal_id, origin);
+      const existing = subscriptions.agents[key];
+      if (!requireStart && existing) {
+        const task = await tx.task(existing);
+        if (task && task.state.status !== "terminal" && task.state.status !== "completing")
+          return existing;
+      }
       const id = await tx.createTask(
         Watcher,
         {
@@ -323,7 +344,7 @@ export function herdrIntegration(config: BotConfig) {
           baseline: agent.state_change_seq,
           requireStart,
           startedAt: Date.now(),
-          ...(origin === undefined ? {} : { origin }),
+          origin,
         },
         { ownership: { kind: "conversation" }, background: true },
       );

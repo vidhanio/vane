@@ -8,9 +8,6 @@ export {
   type BotConfig,
 } from "./config.ts";
 export { Discord } from "./platforms/discord/index.ts";
-export {
-  Session,
-  type DirectMessageIntegration,
-  type MessageOrigin,
-  type ToolActivity,
-} from "./session.ts";
+export type { MessageOrigin } from "./messages.ts";
+export type { DirectMessageIntegration, Platform, ToolActivity } from "./platforms/index.ts";
+export { Session } from "./session.ts";

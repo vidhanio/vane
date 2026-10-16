@@ -1,44 +1,32 @@
 import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { contentText, type ToolCall } from "@earendil-works/pi-ai";
+import { contentText } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   defineDoc,
-  defineEntry,
   LiveDoc,
   SessionFailed,
   type Conversation,
   type ConversationView,
   type Cursor,
   type EntryId,
+  type EntryRecord,
   type LiveState,
   type UserInput,
 } from "@earendil-works/pi-durable";
 import { setTimeout as delay } from "node:timers/promises";
-import { prepareReply, type Reply } from "./attachments.ts";
-import { AgentNotification } from "./notifications.ts";
+import { prepareReply } from "./attachments.ts";
+import {
+  AgentNotification,
+  DirectMessage,
+  messageRequestId,
+  resolveMessageOrigin,
+  type MessageOrigin,
+} from "./messages.ts";
+import type { DirectMessageIntegration, ToolActivity } from "./platforms/index.ts";
 
 const context = BACKGROUND_CONTEXT;
 
-export type MessageOrigin = { platform: string; channelId: string; messageId: string };
-export type ToolActivity = Pick<ToolCall, "id" | "name" | "arguments"> & { details?: unknown };
-
-export interface DirectMessageIntegration {
-  readonly name: string;
-  setTyping(origin: MessageOrigin | undefined): void;
-  progress(
-    origin: MessageOrigin,
-    calls: ToolActivity[],
-    ids: string[],
-    key: string,
-  ): Promise<string[]>;
-  removeProgress(origin: MessageOrigin, ids: string[]): Promise<void>;
-  reply(origin: MessageOrigin, message: Reply, key: string): Promise<void>;
-}
-
-const DirectMessage = defineEntry<MessageOrigin>("vane.message");
-const requestId = (origin: MessageOrigin) =>
-  `${origin.platform}:${origin.channelId}:${origin.messageId}`;
 type DeliveryState = { lastHandledInput?: EntryId; progressIds?: string[] };
 const Delivery = defineDoc<DeliveryState>({
   kind: "vane.delivery",
@@ -63,7 +51,6 @@ export class Session {
   private readonly tools = new Map<EntryId, Map<string, ToolActivity>>();
   private incoming = Promise.resolve();
   private work = Promise.resolve();
-  private closed = false;
   private closing: Promise<void> | undefined;
   private dirty = false;
   private refreshing = false;
@@ -117,8 +104,8 @@ export class Session {
         {
           type: "input",
           content: input,
-          whenBusy: "steer",
-          requestId: requestId(origin),
+          whenBusy: "followUp",
+          requestId: messageRequestId(origin),
           entry: { kind: DirectMessage.kind, data: origin },
         },
         context,
@@ -159,7 +146,6 @@ export class Session {
     this.view.dispose();
     this.cancelPreparation();
     await Promise.all([this.incoming, this.work]);
-    this.closed = true;
   }
 
   private cancelPreparation(): void {
@@ -169,10 +155,7 @@ export class Session {
 
   private enqueue<T>(action: () => Promise<T>): Promise<T> {
     if (this.closing) return Promise.reject(new Error("Session is closing"));
-    const work = this.incoming.then(() => {
-      if (this.closed) throw new Error("Session is closed");
-      return action();
-    });
+    const work = this.incoming.then(action);
     this.incoming = work.then(
       () => undefined,
       () => undefined,
@@ -257,7 +240,7 @@ export class Session {
   }
 
   private setTyping(origin: MessageOrigin | undefined): void {
-    if (this.closed || this.closing) origin = undefined;
+    if (this.closing) origin = undefined;
     for (const integration of this.integrations.values())
       integration.setTyping(integration.name === origin?.platform ? origin : undefined);
   }
@@ -285,101 +268,94 @@ export class Session {
             input.id <= this.delivery.lastHandledInput)
         )
           continue;
-        const originId = AgentNotification.is(input) ? input.data.origin : undefined;
-        const source =
-          originId === undefined
-            ? input
-            : await this.conversation.commit((tx) => tx.entry(originId), context);
-        if (!source || !DirectMessage.is(source))
-          throw new Error(`Missing message origin for input ${input.id}`);
-        const origin = source.data;
-        const integration = this.integrations.get(origin.platform);
-        if (!integration) {
-          this.setTyping(undefined);
-          return;
-        }
-        const result = await this.conversation.commit(
-          (tx) =>
-            tx.submissionByRequest(
-              this.conversation.id,
-              AgentNotification.is(input) ? input.data.requestId : requestId(origin),
-            ),
-          context,
-        );
-        if (this.shutdown.signal.aborted) return;
-        if (!result || result.type !== "input")
-          throw new Error(`Missing submission for input ${input.id}`);
-        const key = `${this.conversation.id}:${input.id}`;
-        if (result.status === "placed" || result.status === "queued") {
-          this.setTyping(origin);
-          const calls = [...(this.tools.get(input.id)?.values() ?? [])];
-          if (calls.length) {
-            const ids = await integration.progress(
-              origin,
-              calls,
-              this.delivery.progressIds ?? [],
-              `${key}:tools`,
-            );
-            if (
-              ids.length !== this.delivery.progressIds?.length ||
-              ids.some((id, index) => id !== this.delivery.progressIds?.[index])
-            ) {
-              await this.conversation.commit(async (tx) => {
-                (await tx.doc(Delivery, this.conversation.id)).progressIds = ids;
-              }, context);
-              this.delivery.progressIds = ids;
-            }
-          }
-          return;
-        }
-        this.setTyping(
-          result.status === "done" || result.reason !== "aborted" ? origin : undefined,
-        );
-        if (this.delivery.progressIds) {
-          const showTools = await this.conversation.commit(
-            async (tx) => (await tx.doc(SessionSettings, this.conversation.id)).showTools,
-            context,
-          );
-          if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
-          await this.conversation.commit(async (tx) => {
-            delete (await tx.doc(Delivery, this.conversation.id)).progressIds;
-          }, context);
-          delete this.delivery.progressIds;
-        }
-        if (result.status === "done") {
-          const answer = await this.conversation.commit(
-            (tx) => tx.entry(AssistantEntry, result.answer),
-            context,
-          );
-          if (!answer) throw new Error(`Missing answer for input ${input.id}`);
-          const text = answer.model
-            ?.flatMap((message) =>
-              message.role === "assistant" ? [contentText(message.content)] : [],
-            )
-            .join("\n");
-          const agent = await this.conversation.agent(context);
-          const reply = await prepareReply(
-            text || "Completed with no text response.",
-            agent.cwd ?? process.cwd(),
-            this.shutdown.signal,
-          );
-          await integration.reply(origin, reply, `${key}:answer`);
-        } else if (result.reason !== "aborted") {
-          await integration.reply(
-            origin,
-            { text: `Session ended without an answer: ${result.reason}.` },
-            `${key}:answer`,
-          );
-        }
-        this.setTyping(undefined);
-        await this.conversation.commit(async (tx) => {
-          (await tx.doc(Delivery, this.conversation.id)).lastHandledInput = input.id;
-        }, context);
-        this.delivery.lastHandledInput = input.id;
-        this.tools.delete(input.id);
+        if (!(await this.deliverInput(input))) return;
       }
       cursor = page.next;
     } while (cursor);
     this.setTyping(undefined);
+  }
+
+  private async deliverInput(input: EntryRecord): Promise<boolean> {
+    const origin = await this.conversation.commit((tx) => resolveMessageOrigin(tx, input), context);
+    const integration = this.integrations.get(origin.platform);
+    if (!integration) {
+      this.setTyping(undefined);
+      return false;
+    }
+    const result = await this.conversation.commit(
+      (tx) =>
+        tx.submissionByRequest(
+          this.conversation.id,
+          AgentNotification.is(input) ? input.data.requestId : messageRequestId(origin),
+        ),
+      context,
+    );
+    if (this.shutdown.signal.aborted) return false;
+    if (!result || result.type !== "input")
+      throw new Error(`Missing submission for input ${input.id}`);
+    const key = `${this.conversation.id}:${input.id}`;
+    if (result.status === "placed" || result.status === "queued") {
+      this.setTyping(origin);
+      await this.updateProgress(integration, origin, input.id, `${key}:tools`);
+      return false;
+    }
+    this.setTyping(result.status === "done" || result.reason !== "aborted" ? origin : undefined);
+    if (this.delivery.progressIds) {
+      const showTools = await this.conversation.commit(
+        async (tx) => (await tx.doc(SessionSettings, this.conversation.id)).showTools,
+        context,
+      );
+      if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
+    }
+    if (result.status === "done") {
+      const answer = await this.conversation.commit(
+        (tx) => tx.entry(AssistantEntry, result.answer),
+        context,
+      );
+      if (!answer) throw new Error(`Missing answer for input ${input.id}`);
+      const text = answer.model
+        ?.flatMap((message) => (message.role === "assistant" ? [contentText(message.content)] : []))
+        .join("\n");
+      const agent = await this.conversation.agent(context);
+      const reply = await prepareReply(
+        text || "Completed with no text response.",
+        agent.cwd ?? process.cwd(),
+        this.shutdown.signal,
+      );
+      await integration.reply(origin, reply, `${key}:answer`);
+    } else if (result.reason !== "aborted") {
+      await integration.reply(
+        origin,
+        { text: `Session ended without an answer: ${result.reason}.` },
+        `${key}:answer`,
+      );
+    }
+    this.setTyping(undefined);
+    await this.conversation.commit(async (tx) => {
+      const delivery = await tx.doc(Delivery, this.conversation.id);
+      delivery.lastHandledInput = input.id;
+      delete delivery.progressIds;
+    }, context);
+    this.delivery.lastHandledInput = input.id;
+    delete this.delivery.progressIds;
+    this.tools.delete(input.id);
+    return true;
+  }
+
+  private async updateProgress(
+    integration: DirectMessageIntegration,
+    origin: MessageOrigin,
+    input: EntryId,
+    key: string,
+  ): Promise<void> {
+    const calls = [...(this.tools.get(input)?.values() ?? [])];
+    if (!calls.length) return;
+    const previous = this.delivery.progressIds ?? [];
+    const ids = await integration.progress(origin, calls, previous, key);
+    if (ids.length === previous.length && ids.every((id, index) => id === previous[index])) return;
+    await this.conversation.commit(async (tx) => {
+      (await tx.doc(Delivery, this.conversation.id)).progressIds = ids;
+    }, context);
+    this.delivery.progressIds = ids;
   }
 }

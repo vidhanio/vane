@@ -1,25 +1,15 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
-  LiveDoc,
-  UsageDoc,
-  type Agent,
-  type ConversationView,
-  type LiveState,
-  type UsageState,
-} from "@earendil-works/pi-durable";
-import {
   ChannelType,
   Client,
-  codeBlock,
-  Colors,
   DiscordAPIError,
-  EmbedBuilder,
   Events,
   GatewayIntentBits,
   HTTPError,
   InteractionContextType,
   MessageFlags,
   Partials,
+  RESTJSONErrorCodes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type DMChannel,
@@ -28,13 +18,14 @@ import {
 } from "discord.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Reply } from "../../attachments.ts";
-import type { Bot } from "../../bot.ts";
 import { log } from "../../log.ts";
-import type { DirectMessageIntegration, MessageOrigin, ToolActivity } from "../../session.ts";
+import type { MessageOrigin } from "../../messages.ts";
+import type { Session } from "../../session.ts";
+import type { Platform, ToolActivity } from "../index.ts";
 import { messageContent } from "./content.ts";
+import { conversationEmbed, errorText, toolText } from "./presentation.ts";
 import { splitMessages } from "./text.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -57,7 +48,7 @@ const commands = (
     .setContexts(InteractionContextType.BotDM),
 );
 
-export class Discord implements DirectMessageIntegration {
+export class Discord implements Platform {
   readonly name = "discord";
   private readonly client = new Client({
     intents: [GatewayIntentBits.DirectMessages],
@@ -67,11 +58,10 @@ export class Discord implements DirectMessageIntegration {
   private readonly config: z.infer<typeof configSchema>;
   private stopping = true;
   private readonly running = new Set<Promise<void>>();
-  private readonly progressText = new Map<string, string>();
   private typing: { channelId: string; controller: AbortController } | undefined;
 
   constructor(
-    private readonly bot: Bot,
+    private readonly session: Session,
     config: unknown,
     private readonly attachmentDirectory: string,
   ) {
@@ -93,7 +83,7 @@ export class Discord implements DirectMessageIntegration {
         return;
       if (!message.content.trim() && !message.attachments.size) return;
       this.track(
-        this.bot.session
+        this.session
           .submit(
             { platform: this.name, channelId: message.channelId, messageId: message.id },
             (signal) => messageContent(message, signal, this.attachmentDirectory),
@@ -117,7 +107,7 @@ export class Discord implements DirectMessageIntegration {
     if (!this.client.application) throw new Error("Discord application is unavailable");
     await this.client.application.commands.set(commands.map((command) => command.toJSON()));
     this.stopping = false;
-    this.bot.session.connect(this);
+    this.session.connect(this);
     log("discord.connected", { userId: this.client.user?.id });
   }
 
@@ -149,7 +139,7 @@ export class Discord implements DirectMessageIntegration {
     const updated: string[] = [];
     for (const [index, content] of parts.entries()) {
       const id = ids[index];
-      if (id && this.progressText.get(id) === content) {
+      if (id && channel.messages.cache.get(id)?.content === content) {
         updated.push(id);
         continue;
       }
@@ -159,7 +149,6 @@ export class Discord implements DirectMessageIntegration {
           message = await channel.messages.edit(id, { content });
         } catch (error) {
           if (!unknownMessage(error)) throw error;
-          this.progressText.delete(id);
         }
       }
       if (!message) {
@@ -172,7 +161,6 @@ export class Discord implements DirectMessageIntegration {
           message = await channel.messages.edit(message.id, { content });
         this.refreshTyping();
       }
-      this.progressText.set(message.id, content);
       updated.push(message.id);
     }
     await this.removeProgress(origin, ids.slice(parts.length));
@@ -188,7 +176,6 @@ export class Discord implements DirectMessageIntegration {
       } catch (error) {
         if (!unknownMessage(error)) throw error;
       }
-      this.progressText.delete(id);
     }
   }
 
@@ -294,16 +281,16 @@ export class Discord implements DirectMessageIntegration {
     try {
       switch (interaction.commandName) {
         case "stop":
-          await this.bot.session.stop();
+          await this.session.stop();
           await interaction.editReply("Response stopped; queued messages cancelled.");
           break;
         case "new":
-          await this.bot.session.reset();
+          await this.session.reset();
           await interaction.editReply("Started a new shared session.");
           break;
         case "tools":
           await interaction.editReply(
-            (await this.bot.session.toggleTools())
+            (await this.session.toggleTools())
               ? "Tools on: tool-call messages will stay in the channel."
               : "Tools off: tool-call messages will be deleted before responses.",
           );
@@ -312,8 +299,8 @@ export class Discord implements DirectMessageIntegration {
           await interaction.editReply({
             embeds: [
               conversationEmbed(
-                await this.bot.session.conversation.agent(context),
-                this.bot.session.view.value,
+                await this.session.conversation.agent(context),
+                this.session.view.value,
               ),
             ],
           });
@@ -336,116 +323,5 @@ function nonce(key: string): string {
 }
 
 function unknownMessage(error: unknown): boolean {
-  return error instanceof DiscordAPIError && error.code === 10008;
-}
-
-function codeText(text: string): string {
-  return stripVTControlCharacters(text).replaceAll("`", "`\u200b").toWellFormed();
-}
-
-function errorText(error: unknown): string {
-  return `ERROR:\n${codeBlock(codeText(error instanceof Error ? error.message : String(error)))}`;
-}
-
-function inline(value: unknown): string {
-  return `\`${stripVTControlCharacters(typeof value === "string" ? value : "")
-    .replaceAll("`", "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toWellFormed()}\``;
-}
-
-function toolText(call: ToolActivity): string {
-  const args = call.arguments;
-  const parsed = z
-    .object({ agent: z.string().optional(), workspace: z.string().optional() })
-    .safeParse(call.details);
-  const agent = inline(
-    parsed.success
-      ? (parsed.data.agent ?? args.agent_target ?? args.agent_name)
-      : (args.agent_target ?? args.agent_name),
-  );
-  const workspace = parsed.success
-    ? (parsed.data.workspace ?? args.workspace_id)
-    : args.workspace_id;
-  const location = typeof workspace === "string" ? ` in ${inline(workspace)}` : "";
-  let text: string;
-  switch (call.name) {
-    case "read":
-      text = `reading ${inline(args.path)}`;
-      break;
-    case "edit":
-      text = `editing ${inline(args.path)}`;
-      break;
-    case "write":
-      text = `writing ${inline(args.path)}`;
-      break;
-    case "bash":
-      text = `running ${inline(args.command)}`;
-      break;
-    case "herdr_list":
-      text = "getting herdr status";
-      break;
-    case "herdr_create_workspace":
-      text = `creating workspace ${inline(args.workspace_name)} at ${inline(args.project_path)}`;
-      break;
-    case "herdr_create_agent":
-      text = `creating agent ${agent}${location}`;
-      break;
-    case "herdr_delete_agent":
-      text = `deleting agent pane ${agent}${location}`;
-      break;
-    case "herdr_delegate":
-      text = `delegating to ${agent}${location}`;
-      break;
-    case "herdr_subscribe":
-      text = `subscribing to ${agent}${location}`;
-      break;
-    case "herdr_read":
-      text = `reading status of ${agent}${location}`;
-      break;
-    default:
-      text = `using ${inline(call.name)}`;
-  }
-  return `-# ${text}`;
-}
-
-function conversationEmbed(agent: Agent, view: ConversationView): EmbedBuilder {
-  const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
-  const usage = view.docs[UsageDoc.definition.kind] as UsageState | undefined;
-  const running = live?.tools?.findLast((tool) => tool.status === "running");
-  const activity = !live?.run
-    ? "idle"
-    : live.compactions?.length
-      ? "compacting"
-      : running
-        ? `using ${running.name}`
-        : live.generation
-          ? "thinking"
-          : "working";
-  let tokens = 0;
-  let cost = 0;
-  for (const bucket of [usage?.models, usage?.tools])
-    for (const entry of Object.values(bucket ?? {})) {
-      tokens += entry.totalTokens;
-      cost += entry.cost.total;
-    }
-  return new EmbedBuilder()
-    .setColor(Colors.Blurple)
-    .setTitle("Shared session status")
-    .addFields(
-      { name: "Status", value: activity, inline: true },
-      {
-        name: "Model",
-        value: agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "Not configured",
-        inline: true,
-      },
-      { name: "Thinking", value: agent.thinkingLevel, inline: true },
-      {
-        name: "Usage",
-        value: `${tokens.toLocaleString("en-US")} tokens · $${cost.toFixed(4)}`,
-        inline: true,
-      },
-      { name: "Directory", value: `\`${agent.cwd ?? "Not configured"}\``, inline: false },
-    );
+  return error instanceof DiscordAPIError && error.code === RESTJSONErrorCodes.UnknownMessage;
 }
