@@ -11,7 +11,7 @@ interface Methods {
   "agent.read": { target: string; source: "visible" | "recent_unwrapped"; lines: number };
   "agent.start": {
     name: string;
-    kind: "pi" | "claude" | "codex";
+    kind: "pi";
     pane_id: string;
     timeout_ms: number;
   };

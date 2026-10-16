@@ -99,19 +99,13 @@ async function report(client: HerdrClient, agent: Agent, context: Context) {
   }
 }
 
-async function start(
-  client: HerdrClient,
-  paneId: string,
-  name: string,
-  kind: "pi" | "claude" | "codex",
-  context: Context,
-) {
+async function start(client: HerdrClient, paneId: string, name: string, context: Context) {
   const launched = agentResult.parse(
     await client.request(
       "agent.start",
       {
         name,
-        kind,
+        kind: "pi",
         pane_id: paneId,
         timeout_ms: 30_000,
       },
@@ -123,14 +117,12 @@ async function start(
     const current = await get(client, paneId, context, Math.max(1, deadline - Date.now()));
     if (current.terminal_id !== launched.terminal_id || current.name !== name)
       throw new Error("Worker identity changed during startup");
-    if (current.agent && current.agent !== kind)
-      throw new Error(`Expected ${kind}, detected ${current.agent}`);
+    if (current.agent && current.agent !== "pi")
+      throw new Error(`Expected pi, detected ${current.agent}`);
     if (
       current.agent_status === "blocked" ||
       (current.interactive_ready &&
-        (current.agent_status === "idle" ||
-          current.agent_status === "done" ||
-          (kind === "codex" && current.agent_status === "unknown")))
+        (current.agent_status === "idle" || current.agent_status === "done"))
     ) {
       const result = await report(client, current, context);
       if (current.agent_status === "blocked")
@@ -364,14 +356,11 @@ export function herdrIntegration(config: BotConfig) {
       defineTool({
         name: "herdr_create_agent",
         description:
-          "Start a named agent in a new tab in an existing Herdr workspace without changing focus. Uses the workspace's working directory and defaults to pi. Returns when the agent is ready; ask the user about startup blockers before sending input.",
+          "Start a named agent in a new tab in an existing Herdr workspace without changing focus. Uses the workspace's working directory and starts pi. Returns when the agent is ready; ask the user about startup blockers before sending input.",
         parameters: Type.Object(
           {
             workspace: Type.String({ minLength: 1 }),
             name: Type.String({ pattern: "^[a-z][a-z0-9_-]{0,31}$" }),
-            kind: Type.Optional(
-              Type.Union([Type.Literal("pi"), Type.Literal("claude"), Type.Literal("codex")]),
-            ),
           },
           strict,
         ),
@@ -401,9 +390,7 @@ export function herdrIntegration(config: BotConfig) {
           api.output(`Starting ${args.name} in ${args.workspace}…\n`);
           try {
             return {
-              output: content(
-                await start(client, tab.root_pane.pane_id, args.name, args.kind ?? "pi", context),
-              ),
+              output: content(await start(client, tab.root_pane.pane_id, args.name, context)),
             };
           } catch (error) {
             context.abortSignal?.throwIfAborted();
