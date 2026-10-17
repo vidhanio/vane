@@ -1,4 +1,4 @@
-import type { AttachedReplicatedState } from "@earendil-works/chord";
+import { copyJson, type AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   AssistantEntry,
@@ -76,7 +76,7 @@ export class Session {
 
   static async open(conversation: Conversation): Promise<Session> {
     const delivery = await conversation.commit(
-      async (tx) => ({ ...(await tx.doc(Delivery, conversation.id)) }),
+      async (tx) => copyJson(await tx.doc(Delivery, conversation.id)) as DeliveryState,
       context,
     );
     return new Session(conversation, await conversation.viewState(context), delivery);

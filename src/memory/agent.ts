@@ -130,14 +130,15 @@ export class MemoryAgent {
   async bind(conversation: Conversation, harness: Harness): Promise<void> {
     this.conversation = conversation;
     this.harness = harness;
-    const { archived, sessionId } = await conversation.commit(
-      async (tx) => ({
-        archived: { ...(await tx.doc(Archive, conversation.id)) },
+    const { count, cursor, sessionId } = await conversation.commit(async (tx) => {
+      const archived = await tx.doc(Archive, conversation.id);
+      return {
+        count: archived.count,
+        cursor: archived.cursor,
         sessionId: (await tx.doc(ProviderDoc, conversation.id)).sessionId,
-      }),
-      context,
-    );
-    this.cursor = archived.cursor;
+      };
+    }, context);
+    this.cursor = cursor;
     this.memory = await Memory.open(
       join(this.config.state_dir, "memory"),
       createCompressor(
@@ -161,7 +162,7 @@ export class MemoryAgent {
         sessionId,
       ),
     );
-    if (this.memory.store.records.length < archived.count)
+    if (this.memory.store.records.length < count)
       throw new Error("The memory log is behind its durable cursor; refusing to lose chat history");
     for (const record of this.memory.store.records)
       if (!this.first.has(record.source.entry)) this.first.set(record.source.entry, record.i);
