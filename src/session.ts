@@ -1,6 +1,5 @@
 import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { contentText } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   defineDoc,
@@ -24,6 +23,7 @@ import {
   type MessageOrigin,
 } from "./messages.ts";
 import type { DirectMessageIntegration, ToolActivity } from "./platforms/index.ts";
+import { readReply, replyTool } from "./reply.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -182,7 +182,7 @@ export class Session {
       for (const message of entry.model ?? []) {
         if (message.role === "assistant")
           for (const block of message.content)
-            if (block.type === "toolCall")
+            if (block.type === "toolCall" && block.name !== replyTool.name)
               calls.set(block.id, { ...calls.get(block.id), ...block });
         if (message.role === "toolResult") {
           const call = calls.get(message.toolCallId);
@@ -308,20 +308,12 @@ export class Session {
       if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
     }
     if (result.status === "done") {
-      const answer = await this.conversation.commit(
-        (tx) => tx.entry(AssistantEntry, result.answer),
-        context,
-      );
-      if (!answer) throw new Error(`Missing answer for input ${input.id}`);
-      const text = answer.model
-        ?.flatMap((message) => (message.role === "assistant" ? [contentText(message.content)] : []))
-        .join("\n");
-      const agent = await this.conversation.agent(context);
-      const reply = await prepareReply(
-        text || "Completed with no text response.",
-        agent.cwd ?? process.cwd(),
-        this.shutdown.signal,
-      );
+      const request = await this.conversation.commit(async (tx) => {
+        const answer = await tx.entry(AssistantEntry, result.answer);
+        if (!answer) throw new Error(`Missing answer for input ${input.id}`);
+        return readReply(tx, answer);
+      }, context);
+      const reply = await prepareReply(request, this.shutdown.signal);
       await integration.reply(origin, reply, `${key}:answer`);
     } else if (result.reason !== "aborted") {
       await integration.reply(

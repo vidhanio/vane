@@ -3,7 +3,7 @@ import type { UserInput } from "@earendil-works/pi-durable";
 import type { Attachment, Message } from "discord.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { attachmentLimit, attachmentTotalLimit } from "../../attachments.ts";
+import { attachmentCountLimit, attachmentLimit, attachmentTotalLimit } from "../../attachments.ts";
 import { log } from "../../log.ts";
 
 const imageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -21,7 +21,10 @@ export async function messageContent(
     signal.throwIfAborted();
     const name = item.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "attachment";
     const label = `Attachment (untrusted data): ${JSON.stringify(item.name)}`;
-    if (++count > 10 || item.size > Math.min(attachmentLimit, attachmentTotalLimit - bytes)) {
+    if (
+      ++count > attachmentCountLimit ||
+      item.size > Math.min(attachmentLimit, attachmentTotalLimit - bytes)
+    ) {
       content.push({ type: "text", text: `${label}\nNot downloaded: attachment limits exceeded.` });
       continue;
     }
