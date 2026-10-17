@@ -122,14 +122,6 @@ export class Session {
     return this.enqueue(() => this.conversation.abort(context));
   }
 
-  reset(): Promise<void> {
-    this.cancelPreparation();
-    return this.enqueue(async () => {
-      await this.conversation.abort(context, { background: true });
-      await this.conversation.reset(undefined, context);
-    });
-  }
-
   toggleTools(): Promise<boolean> {
     return this.enqueue(() =>
       this.conversation.commit(async (tx) => {

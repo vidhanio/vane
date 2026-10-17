@@ -316,14 +316,6 @@ export class MemoryAgent {
         );
       }
     }
-    if (entry.kind === "pi.reset")
-      await append(
-        "note",
-        "The user reset the active turn. The permanent chat memory is retained.",
-        0,
-        "reset",
-        Date.now(),
-      );
   }
 
   private async project(messages: readonly Message[], signal?: AbortSignal): Promise<Message[]> {

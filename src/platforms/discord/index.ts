@@ -39,7 +39,6 @@ const commands = (
     ["stop", "stop the current response and cancel queued messages"],
     ["status", "show the shared session's activity, model and usage"],
     ["tools", "toggle keeping tool-call messages after responses"],
-    ["new", "cancel all work and start a new shared session"],
   ] as const
 ).map(([name, description]) =>
   new SlashCommandBuilder()
@@ -283,10 +282,6 @@ export class Discord implements Platform {
         case "stop":
           await this.session.stop();
           await interaction.editReply("Response stopped; queued messages cancelled.");
-          break;
-        case "new":
-          await this.session.reset();
-          await interaction.editReply("Started a new shared session.");
           break;
         case "tools":
           await interaction.editReply(
