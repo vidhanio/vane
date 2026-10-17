@@ -215,33 +215,64 @@ export function herdrIntegration(config: BotConfig) {
         const input = task.input;
         let message: string | undefined;
         let seenWorking = task.state.checkpoint.seenWorking;
-        let errors = 0;
+        let errors = task.state.checkpoint.errors;
+        let polls = task.state.checkpoint.polls;
+        let subscription;
         try {
-          const agent = await get(client, input.pane, context);
-          if (agent.terminal_id !== input.terminal) {
-            message = "the worker was replaced. no further input was sent.";
-          } else {
-            seenWorking ||= agent.agent_status === "working";
-            const completed =
-              (agent.completion_seq ?? 0) > input.baseline ||
-              ((!input.requireStart || seenWorking) &&
-                (agent.agent_status === "idle" || agent.agent_status === "done"));
-            if (completed || agent.agent_status === "blocked") {
-              message = JSON.stringify(await report(client, agent, context));
-            } else if (
-              input.requireStart &&
-              !seenWorking &&
-              runtime.now() - input.startedAt > 35_000
-            ) {
-              message =
-                "no working or completion state was observed after submission. inspect the agent before retrying; the task was not resent.";
+          subscription = await client.subscribe(input.pane, context);
+          while (message === undefined) {
+            const revision = subscription.revision;
+            const agent = await get(client, input.pane, context);
+            errors = 0;
+            if (agent.terminal_id !== input.terminal) {
+              message = "the worker was replaced. no further input was sent.";
+            } else {
+              seenWorking ||= agent.agent_status === "working";
+              const completed =
+                (agent.completion_seq ?? 0) > input.baseline ||
+                ((!input.requireStart || seenWorking) &&
+                  (agent.agent_status === "idle" || agent.agent_status === "done"));
+              if (completed || agent.agent_status === "blocked") {
+                message = JSON.stringify(await report(client, agent, context));
+              } else if (
+                input.requireStart &&
+                !seenWorking &&
+                runtime.now() - input.startedAt >= 35_000
+              ) {
+                message =
+                  "no working or completion state was observed after submission. inspect the agent before retrying; the task was not resent.";
+              }
             }
+            if (message !== undefined) break;
+            await runtime.commit(
+              () => ({
+                status: "running",
+                checkpoint: { phase: "watch", seenWorking, errors, polls: ++polls },
+              }),
+              context,
+            );
+            await subscription.wait(
+              revision,
+              input.requireStart && !seenWorking
+                ? input.startedAt + 35_000 - runtime.now()
+                : undefined,
+              context,
+            );
           }
         } catch (error) {
           context.abortSignal?.throwIfAborted();
-          errors = task.state.checkpoint.errors + 1;
-          if (errors >= 5)
-            message = `could not monitor the worker: ${error instanceof Error ? error.message : String(error)}. inspect existing work before retrying.`;
+          if (
+            error instanceof HerdrError &&
+            ["agent_not_found", "pane_not_found"].includes(error.code)
+          ) {
+            message = "the worker is no longer available. no further input was sent.";
+          } else {
+            errors++;
+            if (errors >= 5)
+              message = `could not monitor the worker: ${error instanceof Error ? error.message : String(error)}. inspect existing work before retrying.`;
+          }
+        } finally {
+          subscription?.close();
         }
         if (message === undefined) await runtime.sleep(runtime.now() + 1000, context);
         await runtime.commit(
@@ -249,7 +280,7 @@ export function herdrIntegration(config: BotConfig) {
             status: "running",
             checkpoint:
               message === undefined
-                ? { phase: "watch", seenWorking, errors, polls: task.state.checkpoint.polls + 1 }
+                ? { phase: "watch", seenWorking, errors, polls: ++polls }
                 : { phase: "notify", message },
           }),
           context,
