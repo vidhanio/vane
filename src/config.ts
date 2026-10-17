@@ -12,7 +12,7 @@ export const pathSchema = z
 const thinkingSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /** Configuration shared by every platform, owned by the bot. */
-export const botConfigSchema = z.strictObject({
+const botConfigSchema = z.strictObject({
   state_dir: pathSchema.default(
     join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "vane"),
   ),
@@ -43,19 +43,15 @@ export const botConfigSchema = z.strictObject({
 });
 export type BotConfig = z.infer<typeof botConfigSchema>;
 
-export async function validateBotConfig(input: unknown): Promise<BotConfig> {
-  const config = botConfigSchema.parse(input);
+export async function loadConfig(file: string): Promise<BotConfig> {
+  const config = botConfigSchema.parse(expandEnvironment(parse(await Bun.file(file).text())));
   if (!(await stat(config.agent.cwd)).isDirectory())
     throw new Error(`Not a directory: ${config.agent.cwd}`);
   return config;
 }
 
-export async function loadConfig(file: string): Promise<BotConfig> {
-  return validateBotConfig(expandEnvironment(parse(await Bun.file(file).text())));
-}
-
 /** Expand explicit placeholders after TOML parsing, never by rewriting TOML source. */
-export function expandEnvironment(value: unknown): unknown {
+function expandEnvironment(value: unknown): unknown {
   if (typeof value === "string") {
     return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, name: string) => {
       const secret = process.env[name];

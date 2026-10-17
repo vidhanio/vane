@@ -7,7 +7,7 @@ const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const partSchema = z.tuple([integer.max(52), integer]);
 const recordSchema = z.object({
   i: integer,
-  kind: z.enum(["user", "vane", "tool", "echo", "work", "note"]),
+  kind: z.enum(["user", "vane", "tool", "echo", "work"]),
   text: z.string(),
   size: integer,
   date: z.iso.datetime(),
@@ -24,7 +24,7 @@ const viewSchema = z.object({
 });
 export type Record = z.infer<typeof recordSchema>;
 export type Kind = Record["kind"];
-export type SavedView = z.infer<typeof viewSchema>;
+type SavedView = z.infer<typeof viewSchema>;
 
 export class Store {
   readonly records: Record[] = [];

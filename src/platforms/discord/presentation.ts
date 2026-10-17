@@ -79,13 +79,11 @@ export function conversationEmbed(agent: Agent, view: ConversationView): EmbedBu
   const running = live?.tools?.findLast((tool) => tool.status === "running");
   const activity = !live?.run
     ? "idle"
-    : live.compactions?.length
-      ? "compacting"
-      : running
-        ? `using ${running.name}`
-        : live.generation
-          ? "thinking"
-          : "working";
+    : running
+      ? `using ${running.name}`
+      : live.generation
+        ? "thinking"
+        : "working";
   let tokens = 0;
   let cost = 0;
   for (const bucket of [usage?.models, usage?.tools])

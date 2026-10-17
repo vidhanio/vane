@@ -33,7 +33,7 @@ export class HerdrError extends Error {
   }
 }
 
-export class HerdrSubscription {
+class HerdrSubscription {
   private version = 0;
   private failure: Error | undefined;
   private wake: (() => void) | undefined;

@@ -186,22 +186,10 @@ export class Session {
         }
       }
     }
-    const owners = new Map<string, Map<string, ToolActivity>>();
-    for (const calls of this.tools.values()) for (const id of calls.keys()) owners.set(id, calls);
+    const captured = new Map([...this.tools.values()].flatMap((calls) => [...calls]));
     for (const slot of live?.tools ?? []) {
-      const call = owners.get(slot.callId)?.get(slot.callId);
+      const call = captured.get(slot.callId);
       if (call && slot.details !== undefined) call.details = slot.details;
-    }
-    for (const nested of live?.nestedTools ?? []) {
-      const calls = owners.get(nested.parentCallId);
-      if (!calls) continue;
-      calls.set(nested.callId, {
-        id: nested.callId,
-        name: nested.name,
-        arguments: nested.arguments,
-        details: nested.details ?? calls.get(nested.callId)?.details,
-      });
-      owners.set(nested.callId, calls);
     }
   }
 

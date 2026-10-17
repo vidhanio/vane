@@ -4,7 +4,17 @@ export const bytes = (text: string) => Buffer.byteLength(text, "utf8");
 export const start = ([l, i]: Part) => i * 2 ** l;
 export const end = (part: Part) => start(part) + 2 ** part[0];
 export const key = ([l, i]: Part) => `${l}:${i}`;
-export const flat = (text: string) => text.replace(/[\r\n]+/g, " ");
+export const label = (part: Part) => `${start(part)}+${2 ** part[0]}`;
+export const parent = ([l, i]: Part): Part => [l + 1, Math.floor(i / 2)];
+export const children = ([l, i]: Part): [Part, Part] => {
+  if (l === 0) throw new Error("Leaf memory nodes have no children");
+  return [
+    [l - 1, i * 2],
+    [l - 1, i * 2 + 1],
+  ];
+};
+
+const line = (part: Part, text: string) => `${label(part)}|${text.replace(/[\r\n]+/g, " ")}`;
 
 export class View {
   parts: Part[] = [];
@@ -18,8 +28,8 @@ export class View {
 
   line(part: Part): string {
     const node = this.node(part);
-    if (!node) throw new Error(`Memory node ${start(part)}+${2 ** part[0]} is not built`);
-    return `${start(part)}+${2 ** part[0]}|${flat(node.text)}`;
+    if (!node) throw new Error(`Memory node ${label(part)} is not built`);
+    return line(part, node.text);
   }
 
   render(boundary = Infinity): string {
@@ -29,8 +39,7 @@ export class View {
       if (end(part) <= boundary) {
         lines.push(this.line(part));
       } else if (part[0] > 0) {
-        visit([part[0] - 1, part[1] * 2]);
-        visit([part[0] - 1, part[1] * 2 + 1]);
+        children(part).forEach(visit);
       }
     };
     for (const part of this.parts) visit(part);
@@ -40,17 +49,14 @@ export class View {
   get size(): number {
     return (
       16 +
-      this.parts.reduce((sum, part) => {
-        const text = this.node(part)?.text ?? "";
-        return sum + bytes(`${start(part)}+${2 ** part[0]}|${flat(text)}\n`);
-      }, 0)
+      this.parts.reduce((sum, part) => sum + bytes(line(part, this.node(part)?.text ?? "")) + 1, 0)
     );
   }
 
   fit(total: number, force = false): boolean {
-    if (force || this.size > this.high) this.merging = true;
-    let changed = false;
     let size = this.size;
+    if (force || size > this.high) this.merging = true;
+    let changed = false;
     while (this.merging && size > this.low) {
       let best = -1;
       let due = -Infinity;
@@ -60,7 +66,7 @@ export class View {
         if (!a || !b) continue;
         if (a[0] !== b[0] || a[1] % 2 !== 0 || b[1] !== a[1] + 1) continue;
         const age = (total - (end(b) - 1)) / 2 ** a[0];
-        if (age > due && this.node([a[0] + 1, a[1] / 2])) {
+        if (age > due && this.node(parent(a))) {
           best = j;
           due = age;
         }
@@ -69,9 +75,9 @@ export class View {
       const a = this.parts[best];
       const b = this.parts[best + 1];
       if (!a || !b) break;
-      const parent: Part = [a[0] + 1, a[1] / 2];
-      size += bytes(this.line(parent)) - bytes(this.line(a)) - bytes(this.line(b)) - 1;
-      this.parts.splice(best, 2, parent);
+      const merged = parent(a);
+      size += bytes(this.line(merged)) - bytes(this.line(a)) - bytes(this.line(b)) - 1;
+      this.parts.splice(best, 2, merged);
       changed = true;
     }
     if (size <= this.low) this.merging = false;

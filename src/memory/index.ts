@@ -1,18 +1,18 @@
 import { EventEmitter } from "node:events";
 import { Mutex } from "async-mutex";
 import { Store, type Kind, type Record } from "./store.ts";
-import { bytes, end, key, start, View, type Part } from "./view.ts";
+import { bytes, children, end, key, label, parent, start, View, type Part } from "./view.ts";
 
-export type Compression = { part: Part; source: string; view: string };
+type Compression = { part: Part; source: string; view: string };
 export type Compressor = (input: Compression, signal: AbortSignal) => Promise<string>;
 
-export function split(text: string, limit = 30_000): string[] {
+export function split(text: string): string[] {
   const parts: string[] = [];
   let part = "";
   let size = 0;
   for (const character of text) {
     const length = bytes(character);
-    if (size + length > limit) {
+    if (size + length > 30_000) {
       parts.push(part);
       part = "";
       size = 0;
@@ -41,7 +41,7 @@ export class Memory {
   private readonly leaves = new Set<number>();
   private readonly merges = new Map<string, Part>();
   private readonly active = new Map<string, Promise<void>>();
-  private readonly failed = new Map<string, unknown>();
+  private readonly failed = new Set<string>();
   private frontier = 0;
   private scheduled = false;
   private stopped = false;
@@ -143,13 +143,13 @@ export class Memory {
       this.frontier++;
   }
 
-  private queueParent([l, i]: Part): void {
-    const parent: Part = [l + 1, Math.floor(i / 2)];
+  private queueParent(part: Part): void {
+    const merged = parent(part);
     if (
-      this.store.nodes.has(key([l, i % 2 === 0 ? i + 1 : i - 1])) &&
-      !this.store.nodes.has(key(parent))
+      !this.store.nodes.has(key(merged)) &&
+      children(merged).every((child) => this.store.nodes.has(key(child)))
     )
-      this.merges.set(key(parent), parent);
+      this.merges.set(key(merged), merged);
   }
 
   private schedule(): void {
@@ -168,9 +168,8 @@ export class Memory {
       if (this.active.has(id) || this.failed.has(id)) return;
       const work = this.build(part)
         .catch((error: unknown) => {
-          this.failed.set(id, error);
-          if (!this.stopped)
-            console.error(`Memory compaction ${start(part)}+${2 ** part[0]} failed`, error);
+          this.failed.add(id);
+          if (!this.stopped) console.error(`Memory compaction ${label(part)} failed`, error);
         })
         .finally(() => {
           this.active.delete(id);
@@ -193,18 +192,20 @@ export class Memory {
 
   private async build(part: Part): Promise<void> {
     const [l, i] = part;
-    const record = this.store.records[i];
-    if (l === 0 && !record) throw new Error("Missing source message");
-    const source =
-      l === 0 && record
-        ? `${record.kind}: ${record.text}`
-        : [0, 1]
-            .map((offset) => {
-              const child = this.store.nodes.get(key([l - 1, i * 2 + offset]));
-              if (!child) throw new Error("Missing child summary");
-              return child.text;
-            })
-            .join("\n");
+    let source: string;
+    if (l === 0) {
+      const record = this.store.records[i];
+      if (!record) throw new Error("Missing source message");
+      source = `${record.kind}: ${record.text}`;
+    } else {
+      source = children(part)
+        .map((child) => {
+          const node = this.store.nodes.get(key(child));
+          if (!node) throw new Error("Missing child summary");
+          return node.text;
+        })
+        .join("\n");
+    }
     const boundary = Math.min(this.frontier, l === 0 ? start(part) : end(part));
     const text =
       bytes(source) <= 512
@@ -289,8 +290,9 @@ export class Memory {
       throw new Error(`No memory line ${id}+${n}`);
     if (n > 1) {
       if (offset) throw new Error("offset is only valid with n = 1");
-      const l = Math.log2(n) - 1;
-      return [0, 1].map((side) => this.chat.line([l, (id / n) * 2 + side])).join("\n");
+      return children([Math.log2(n), id / n])
+        .map((part) => this.chat.line(part))
+        .join("\n");
     }
     const record = this.store.records[id];
     if (!record) throw new Error(`No memory message ${id}`);

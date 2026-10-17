@@ -195,8 +195,8 @@ export class MemoryAgent {
       const total = (state.models[name] ??= zeroUsage());
       for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const)
         total[field] += usage[field];
-      if (usage.cacheWrite1h !== undefined)
-        total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
+      for (const field of ["cacheWrite1h", "reasoning"] as const)
+        if (usage[field] !== undefined) total[field] = (total[field] ?? 0) + usage[field];
       for (const field of ["input", "output", "cacheRead", "cacheWrite", "total"] as const)
         total.cost[field] += usage.cost[field];
     }, context);
@@ -301,13 +301,7 @@ export class MemoryAgent {
                 )
                 .join("\n");
         await append(
-          message.role === "toolResult"
-            ? "echo"
-            : AgentNotification.is(entry)
-              ? "work"
-              : entry.kind === "pi.compaction"
-                ? "note"
-                : "user",
+          message.role === "toolResult" ? "echo" : AgentNotification.is(entry) ? "work" : "user",
           message.role === "toolResult"
             ? `${message.toolName}${message.isError ? " (error)" : ""}: ${text}`
             : text,

@@ -5,7 +5,7 @@ export const memoryPrompt = `You are vane, an AI agent that works for one user i
 Your memory is the whole chat, oldest first, inside <chat> tags as one-line summaries:
   id+n|text   the n messages from id on, summarized (newlines as spaces)
 
-Kinds: user (the user's words), vane (your replies), tool (tool calls), echo (tool results), work (an agent's report, starting "[Name]"), note (imported memories or lifecycle events).
+Kinds: user (the user's words), vane (your replies), tool (tool calls), echo (tool results), work (an agent's report, starting "[Name]").
 Each message is compressed into a line, then adjacent sibling lines merge into a binary tree. Recent lines cover fewer messages; old lines cover more. Long text is split over consecutive messages.
 zoom(id, n) opens a line into its two children; zoom(id, 1) gives the original message with its images. Large messages have pages. n is a power of two and id is a multiple of n. date(id) returns the original timestamp. External Herdr agents keep their own chats: use herdr_read to inspect their live terminal, not zoom with a name.
 

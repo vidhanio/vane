@@ -11,7 +11,7 @@ import {
 import { resolve } from "node:path";
 import { attachmentCountLimit, type ReplyRequest } from "./attachments.ts";
 
-export const ReplyManifest = defineEntry<ReplyRequest & { answer: EntryId }>("vane.reply");
+const ReplyManifest = defineEntry<ReplyRequest & { answer: EntryId }>("vane.reply");
 
 export const replyTool = defineTool({
   name: "reply",

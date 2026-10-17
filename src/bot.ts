@@ -53,7 +53,6 @@ export class Bot {
           env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? config.agent.cwd }),
           settings: {
             toolExecution: "parallel",
-            followUpMode: "one-at-a-time",
             compaction: { enabled: false },
           },
           onReport: (error) => console.error("Agent error", error),

@@ -6,7 +6,7 @@ export const attachmentCountLimit = 10;
 export const attachmentLimit = 10 * 1024 * 1024;
 export const attachmentTotalLimit = 20 * 1024 * 1024;
 export type ReplyRequest = { text: string; attachments: string[] };
-export type ReplyAttachment = { name: string; data: Buffer };
+type ReplyAttachment = { name: string; data: Buffer };
 export type Reply = { text: string; attachments?: ReplyAttachment[] };
 
 export async function prepareReply(reply: ReplyRequest, signal: AbortSignal): Promise<Reply> {

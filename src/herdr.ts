@@ -4,6 +4,7 @@ import {
   defineDoc,
   defineTask,
   defineTool,
+  type ConversationId,
   type EntryId,
   type TaskId,
   type ToolExecutionApi,
@@ -27,19 +28,22 @@ const agentSchema = z.object({
   terminal_id: z.string(),
   pane_id: z.string(),
   workspace_id: z.string(),
-  name: z.string().nullish().default(null),
-  agent: z.string().nullish().default(null),
-  title: z.string().nullish().default(null),
-  terminal_title_stripped: z.string().nullish().default(null),
+  name: z.string().optional(),
+  agent: z.string().optional(),
+  title: z.string().optional(),
+  terminal_title_stripped: z.string().optional(),
   agent_status: z.enum(["idle", "done", "working", "blocked", "unknown"]),
   interactive_ready: z.boolean().default(false),
   launch_pending: z.boolean().default(false),
-  cwd: z.string().nullish().default(null),
+  cwd: z.string().optional(),
   state_change_seq: z.number(),
-  completion_seq: z.number().nullish(),
+  completion_seq: z.number().optional(),
 });
 type Agent = z.infer<typeof agentSchema>;
 const agentResult = z.object({ agent: agentSchema });
+const workspaceResult = z.object({
+  workspaces: z.array(z.looseObject({ workspace_id: z.string(), label: z.string() })),
+});
 const Subscriptions = defineDoc<{ agents: Record<string, TaskId<null>> }>({
   kind: "vane.herdr.subscriptions",
   version: 1,
@@ -72,6 +76,17 @@ async function subscriptionKey(
   const source = await tx.entry(DirectMessage, origin);
   if (!source) throw new Error(`Missing message origin: ${origin}`);
   return `${pane}:${terminal}:${source.data.platform}:${source.data.channelId}`;
+}
+
+async function removeSubscription(
+  tx: Tx,
+  conversationId: ConversationId,
+  input: WatchInput,
+  taskId: TaskId<null>,
+): Promise<void> {
+  const subscriptions = await tx.doc(Subscriptions, conversationId);
+  const key = await subscriptionKey(tx, input.pane, input.terminal, input.origin);
+  if (subscriptions.agents[key] === taskId) delete subscriptions.agents[key];
 }
 
 async function get(
@@ -156,18 +171,16 @@ async function start(client: HerdrClient, paneId: string, name: string, context:
       throw new Error("Worker identity changed during startup");
     if (current.agent && current.agent !== "pi")
       throw new Error(`Expected pi, detected ${current.agent}`);
+    if (current.agent_status === "blocked")
+      throw new HerdrError(
+        "agent_not_ready",
+        `Agent ${name} is blocked during startup; ask the user before sending input`,
+      );
     if (
-      current.agent_status === "blocked" ||
-      (current.interactive_ready &&
-        (current.agent_status === "idle" || current.agent_status === "done"))
-    ) {
-      if (current.agent_status === "blocked")
-        throw new HerdrError(
-          "agent_not_ready",
-          `Agent ${name} is blocked during startup; ask the user before sending input`,
-        );
+      current.interactive_ready &&
+      (current.agent_status === "idle" || current.agent_status === "done")
+    )
       return report(client, current, context);
-    }
     if (
       (current.agent_status === "idle" || current.agent_status === "done") &&
       !current.launch_pending &&
@@ -193,9 +206,9 @@ export function herdrIntegration(config: BotConfig) {
     return value;
   };
   const workspaceName = async (id: string, context: Context) => {
-    const { workspaces } = z
-      .object({ workspaces: z.array(z.object({ workspace_id: z.string(), label: z.string() })) })
-      .parse(await client.request("workspace.list", {}, context));
+    const { workspaces } = workspaceResult.parse(
+      await client.request("workspace.list", {}, context),
+    );
     return workspaces.find((workspace) => workspace.workspace_id === id)?.label ?? id;
   };
   const describe = async (agent: Agent, api: ToolExecutionApi, context: Context) => {
@@ -223,7 +236,6 @@ export function herdrIntegration(config: BotConfig) {
           while (message === undefined) {
             const revision = subscription.revision;
             const agent = await get(client, input.pane, context);
-            errors = 0;
             if (agent.terminal_id !== input.terminal) {
               message = "the worker was replaced. no further input was sent.";
             } else {
@@ -258,6 +270,7 @@ export function herdrIntegration(config: BotConfig) {
                 : undefined,
               context,
             );
+            errors = 0;
           }
         } catch (error) {
           context.abortSignal?.throwIfAborted();
@@ -307,28 +320,14 @@ export function herdrIntegration(config: BotConfig) {
           context,
         );
         await runtime.commit(async (tx) => {
-          const subscriptions = await tx.doc(Subscriptions, runtime.conversationId);
-          const key = await subscriptionKey(
-            tx,
-            task.input.pane,
-            task.input.terminal,
-            task.input.origin,
-          );
-          if (subscriptions.agents[key] === task.id) delete subscriptions.agents[key];
+          await removeSubscription(tx, runtime.conversationId, task.input, task.id);
           return { status: "terminal", outcome: { status: "completed", result: null } };
         }, context);
       },
     },
     abort: (task, runtime, context) =>
       runtime.commit(async (tx) => {
-        const subscriptions = await tx.doc(Subscriptions, runtime.conversationId);
-        const key = await subscriptionKey(
-          tx,
-          task.input.pane,
-          task.input.terminal,
-          task.input.origin,
-        );
-        if (subscriptions.agents[key] === task.id) delete subscriptions.agents[key];
+        await removeSubscription(tx, runtime.conversationId, task.input, task.id);
         return { status: "terminal", outcome: { status: "aborted" } };
       }, context),
   });
@@ -392,15 +391,11 @@ export function herdrIntegration(config: BotConfig) {
           "List Herdr workspaces and live agents. Use workspace_id (not label) to create an agent, and an agent's name or pane_id to read, subscribe, or delegate.",
         parameters: Type.Object({}, strict),
         execute: async (_args, _api, context) => {
-          const [workspaceResult, agentList] = await Promise.all([
+          const [workspaceList, agentList] = await Promise.all([
             client.request("workspace.list", {}, context),
             client.request("agent.list", {}, context),
           ]);
-          const { workspaces } = z
-            .object({
-              workspaces: z.array(z.looseObject({ workspace_id: z.string(), label: z.string() })),
-            })
-            .parse(workspaceResult);
+          const { workspaces } = workspaceResult.parse(workspaceList);
           const { agents } = z.object({ agents: z.array(agentSchema) }).parse(agentList);
           return { output: content({ workspaces, agents }) };
         },
@@ -463,7 +458,7 @@ export function herdrIntegration(config: BotConfig) {
           );
           const { panes } = z
             .object({
-              panes: z.array(z.object({ cwd: z.string().nullish(), focused: z.boolean() })),
+              panes: z.array(z.object({ cwd: z.string().optional(), focused: z.boolean() })),
             })
             .parse(await client.request("pane.list", { workspace_id: args.workspace_id }, context));
           const cwd =
@@ -508,7 +503,7 @@ export function herdrIntegration(config: BotConfig) {
         ),
         execute: async (args, api, context) => {
           let paneId: string;
-          let name: string | null = null;
+          let name: string | undefined;
           let terminal: string | undefined;
           try {
             const agent = await get(client, args.agent_target, context);
