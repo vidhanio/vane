@@ -9,6 +9,8 @@ export const pathSchema = z
   .min(1)
   .transform((value) => resolve(value.replace(/^~(?=\/|$)/, homedir())));
 
+const thinkingSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
 /** Configuration shared by every platform, owned by the bot. */
 export const botConfigSchema = z.strictObject({
   state_dir: pathSchema.default(
@@ -25,10 +27,17 @@ export const botConfigSchema = z.strictObject({
   ),
   /** Platform tables, keyed by platform name. Each platform parses its own. */
   platforms: z.record(z.string().regex(/^[a-z][a-z0-9_-]*$/), z.unknown()).default({}),
+  memory: z
+    .strictObject({
+      provider: z.string().min(1).default("anthropic"),
+      model_id: z.string().min(1).default("claude-haiku-4-5"),
+      thinking: thinkingSchema.default("xhigh"),
+    })
+    .prefault({}),
   agent: z.strictObject({
     provider: z.string().min(1),
     model_id: z.string().min(1),
-    thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).default("medium"),
+    thinking: thinkingSchema.default("medium"),
     cwd: pathSchema.default("/tmp"),
   }),
 });

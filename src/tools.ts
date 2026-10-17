@@ -3,12 +3,14 @@ import type { BotConfig } from "./config.ts";
 import { herdrIntegration } from "./herdr.ts";
 import { instructionSection } from "./instructions.ts";
 import { replyTool } from "./reply.ts";
+import { memoryPrompt } from "./memory/prompt.ts";
 
 export function botTools(config: BotConfig) {
   const herdr = herdrIntegration(config);
   return defineExtension({
     name: "vane",
     sections: [
+      section("memory", () => memoryPrompt, { tag: false }),
       section(
         "vane",
         ({ agent }) =>

@@ -27,7 +27,11 @@ import { readReply, replyTool } from "./reply.ts";
 
 const context = BACKGROUND_CONTEXT;
 
-type DeliveryState = { lastHandledInput?: EntryId; progressIds?: string[] };
+type DeliveryState = {
+  lastHandledInput?: EntryId;
+  progressIds?: string[];
+  lastAnswer?: { answer: EntryId; destinations: string[] };
+};
 const Delivery = defineDoc<DeliveryState>({
   kind: "vane.delivery",
   version: 1,
@@ -104,7 +108,7 @@ export class Session {
         {
           type: "input",
           content: input,
-          whenBusy: "followUp",
+          whenBusy: "steer",
           requestId: messageRequestId(origin),
           entry: { kind: DirectMessage.kind, data: origin },
         },
@@ -307,7 +311,25 @@ export class Session {
       );
       if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
     }
-    if (result.status === "done") {
+    const destination = `${origin.platform}:${origin.channelId}`;
+    const previousAnswer = this.delivery.lastAnswer;
+    const alreadyDelivered =
+      result.status === "done" &&
+      previousAnswer?.answer === result.answer &&
+      previousAnswer.destinations.includes(destination);
+    const lastAnswer =
+      result.status === "done"
+        ? {
+            answer: result.answer,
+            destinations: [
+              ...new Set([
+                ...(previousAnswer?.answer === result.answer ? previousAnswer.destinations : []),
+                destination,
+              ]),
+            ],
+          }
+        : previousAnswer;
+    if (result.status === "done" && !alreadyDelivered) {
       const request = await this.conversation.commit(async (tx) => {
         const answer = await tx.entry(AssistantEntry, result.answer);
         if (!answer) throw new Error(`Missing answer for input ${input.id}`);
@@ -315,7 +337,7 @@ export class Session {
       }, context);
       const reply = await prepareReply(request, this.shutdown.signal);
       await integration.reply(origin, reply, `${key}:answer`);
-    } else if (result.reason !== "aborted") {
+    } else if (result.status !== "done" && result.reason !== "aborted") {
       await integration.reply(
         origin,
         { text: `Session ended without an answer: ${result.reason}.` },
@@ -326,9 +348,11 @@ export class Session {
     await this.conversation.commit(async (tx) => {
       const delivery = await tx.doc(Delivery, this.conversation.id);
       delivery.lastHandledInput = input.id;
+      if (lastAnswer) delivery.lastAnswer = lastAnswer;
       delete delivery.progressIds;
     }, context);
     this.delivery.lastHandledInput = input.id;
+    if (lastAnswer) this.delivery.lastAnswer = lastAnswer;
     delete this.delivery.progressIds;
     this.tools.delete(input.id);
     return true;

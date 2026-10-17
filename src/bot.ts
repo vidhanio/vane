@@ -11,6 +11,7 @@ import type { BotConfig } from "./config.ts";
 import { botTools } from "./tools.ts";
 import { log } from "./log.ts";
 import { Session } from "./session.ts";
+import { MemoryAgent } from "./memory/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -19,6 +20,7 @@ export class Bot {
   private constructor(
     readonly harness: Harness,
     readonly session: Session,
+    private readonly memory: MemoryAgent,
     private readonly release: () => Promise<void>,
   ) {}
 
@@ -28,6 +30,10 @@ export class Bot {
       throw new Error(`Unknown model ${config.agent.provider}/${config.agent.model_id}`);
     if (!(await models.getAuth(config.agent.provider)))
       throw new Error(`Missing authentication for ${config.agent.provider}`);
+    if (!models.getModel(config.memory.provider, config.memory.model_id))
+      throw new Error(`Unknown memory model ${config.memory.provider}/${config.memory.model_id}`);
+    if (!(await models.getAuth(config.memory.provider)))
+      throw new Error(`Missing authentication for ${config.memory.provider}`);
     await mkdir(config.state_dir, { recursive: true, mode: 0o700 });
     const release = await lock(config.state_dir, {
       retries: { retries: 5, minTimeout: 1000, maxTimeout: 3000 },
@@ -36,14 +42,20 @@ export class Bot {
       const registry = createRegistry();
       registry.install(CodingTools);
       registry.install(botTools(config));
+      const memory = new MemoryAgent(config, models);
+      registry.install(memory.extension());
       const storage = await openNodeSqliteStorage(join(config.state_dir, "vane.sqlite"));
       const harness = await Harness.open(
         storage,
         {
-          models,
+          models: memory.models,
           registry,
           env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? config.agent.cwd }),
-          settings: { toolExecution: "parallel", followUpMode: "one-at-a-time" },
+          settings: {
+            toolExecution: "parallel",
+            followUpMode: "one-at-a-time",
+            compaction: { enabled: false },
+          },
           onReport: (error) => console.error("Agent error", error),
         },
         context,
@@ -64,13 +76,20 @@ export class Bot {
             cwd: config.agent.cwd,
           },
         })
-        .then((conversation) => Session.open(conversation))
+        .then(async (conversation) => {
+          await memory.bind(conversation, harness);
+          return Session.open(conversation);
+        })
         .catch(async (error: unknown) => {
-          await harness.close(context);
+          try {
+            await harness.close(context);
+          } finally {
+            await memory.close();
+          }
           throw error;
         });
       harness.resume();
-      return new Bot(harness, session, release);
+      return new Bot(harness, session, memory, release);
     } catch (error) {
       await release();
       throw error;
@@ -81,8 +100,13 @@ export class Bot {
     try {
       try {
         await this.session.close();
+        await this.memory.prepareClose();
       } finally {
-        await this.harness.close(context);
+        try {
+          await this.harness.close(context);
+        } finally {
+          await this.memory.close();
+        }
       }
     } finally {
       await this.release();

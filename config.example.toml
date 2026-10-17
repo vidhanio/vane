@@ -10,3 +10,8 @@ provider = "anthropic"
 model_id = "claude-sonnet-4-5"
 thinking = "medium"
 cwd = "~/Projects"
+
+[memory]
+provider = "anthropic"
+model_id = "claude-haiku-4-5"
+thinking = "xhigh"
