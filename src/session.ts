@@ -3,15 +3,18 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   AssistantEntry,
   defineDoc,
-  LiveDoc,
+  defineEntry,
+  defineExtension,
+  wrapTool,
   SessionFailed,
   type Conversation,
   type ConversationView,
   type Cursor,
   type EntryId,
   type EntryRecord,
-  type LiveState,
   type UserInput,
+  type ToolRegistration,
+  type JsonObject,
 } from "@earendil-works/pi-durable";
 import { setTimeout as delay } from "node:timers/promises";
 import { prepareReply } from "./attachments.ts";
@@ -23,13 +26,76 @@ import {
   type MessageOrigin,
 } from "./messages.ts";
 import type { DirectMessageIntegration, ToolActivity } from "./platforms/index.ts";
-import { readReply, replyTool } from "./reply.ts";
+import { MissingReplyManifest, readReply, replyTool } from "./reply.ts";
 
 const context = BACKGROUND_CONTEXT;
+const ToolAdmission = defineEntry<{ id: string; name: string; arguments: JsonObject }>(
+  "vane.tool.admission",
+);
+
+export function toolNotices(tools: readonly ToolRegistration[]) {
+  return defineExtension({
+    name: "vane.tool.notices",
+    wraps: tools
+      .filter((tool) => tool.name !== replyTool.name)
+      .map((tool) =>
+        wrapTool(tool, (original) => ({
+          ...original,
+          execute: async (args, api, callContext) => {
+            await api.commit(async (tx) => {
+              let cursor;
+              do {
+                const page = await tx.scanEntries(
+                  { conversationId: api.conversationId },
+                  100,
+                  cursor,
+                );
+                if (
+                  page.items.some(
+                    (entry) => ToolAdmission.is(entry) && entry.data.id === api.callId,
+                  )
+                )
+                  return;
+                if (
+                  page.items.some(
+                    (entry) =>
+                      AssistantEntry.is(entry) &&
+                      entry.model?.some(
+                        (message) =>
+                          message.role === "assistant" &&
+                          message.content.some(
+                            (block) => block.type === "toolCall" && block.id === api.callId,
+                          ),
+                      ),
+                  )
+                )
+                  break;
+                cursor = page.next;
+              } while (cursor);
+              await tx.appendEntry(ToolAdmission, api.conversationId, {
+                data: {
+                  id: api.callId,
+                  name: original.name,
+                  arguments: copyJson(args) as JsonObject,
+                },
+              });
+            }, callContext);
+            return original.execute(args, api, callContext);
+          },
+        })),
+      ),
+  });
+}
 
 type DeliveryState = {
   lastHandledInput?: EntryId;
-  progressIds?: string[];
+  announcement?: { input: EntryId; count: number };
+  lastFailure?: {
+    input: EntryId;
+    answer: EntryId;
+    reason: "missing_reply_manifest";
+    destinations: string[];
+  };
   lastAnswer?: { answer: EntryId; destinations: string[] };
 };
 const Delivery = defineDoc<DeliveryState>({
@@ -52,7 +118,7 @@ const SessionSettings = defineDoc<{ showTools: boolean }>({
 
 export class Session {
   private readonly integrations = new Map<string, DirectMessageIntegration>();
-  private readonly tools = new Map<EntryId, Map<string, ToolActivity>>();
+  private readonly tools = new Map<EntryId, Map<string, ToolActivity | null | undefined>>();
   private incoming = Promise.resolve();
   private work = Promise.resolve();
   private closing: Promise<void> | undefined;
@@ -161,7 +227,19 @@ export class Session {
 
   private captureTools(): void {
     const view = this.view.value;
-    const live = view.docs[LiveDoc.definition.kind] as LiveState | undefined;
+    this.tools.clear();
+    const resolved = new Set(
+      view.entries.flatMap((entry) =>
+        (entry.model ?? []).flatMap((message) =>
+          message.role === "toolResult" ? [message.toolCallId] : [],
+        ),
+      ),
+    );
+    const admitted = new Map(
+      view.entries.flatMap((entry) =>
+        ToolAdmission.is(entry) ? [[entry.data.id, entry.data] as const] : [],
+      ),
+    );
     let input: EntryId | undefined;
     for (const entry of view.entries) {
       if (DirectMessage.is(entry) || AgentNotification.is(entry)) input = entry.id;
@@ -176,20 +254,13 @@ export class Session {
         this.tools.set(input, calls);
       }
       for (const message of entry.model ?? []) {
-        if (message.role === "assistant")
+        if (message.role === "assistant" && message.stopReason === "toolUse")
           for (const block of message.content)
-            if (block.type === "toolCall" && block.name !== replyTool.name)
-              calls.set(block.id, { ...calls.get(block.id), ...block });
-        if (message.role === "toolResult") {
-          const call = calls.get(message.toolCallId);
-          if (call) call.details = message.details;
-        }
+            if (block.type === "toolCall" && block.name !== replyTool.name) {
+              const admission = admitted.get(block.id);
+              calls.set(block.id, admission ?? (resolved.has(block.id) ? null : undefined));
+            }
       }
-    }
-    const captured = new Map([...this.tools.values()].flatMap((calls) => [...calls]));
-    for (const slot of live?.tools ?? []) {
-      const call = captured.get(slot.callId);
-      if (call && slot.details !== undefined) call.details = slot.details;
     }
   }
 
@@ -278,26 +349,19 @@ export class Session {
     if (!result || result.type !== "input")
       throw new Error(`Missing submission for input ${input.id}`);
     const key = `${this.conversation.id}:${input.id}`;
+    await this.announceTools(integration, origin, input.id, `${key}:tools`);
     if (result.status === "placed" || result.status === "queued") {
       this.setTyping(origin);
-      await this.updateProgress(integration, origin, input.id, `${key}:tools`);
       return false;
     }
     this.setTyping(result.status === "done" || result.reason !== "aborted" ? origin : undefined);
-    if (this.delivery.progressIds) {
-      const showTools = await this.conversation.commit(
-        async (tx) => (await tx.doc(SessionSettings, this.conversation.id)).showTools,
-        context,
-      );
-      if (!showTools) await integration.removeProgress(origin, this.delivery.progressIds);
-    }
     const destination = `${origin.platform}:${origin.channelId}`;
     const previousAnswer = this.delivery.lastAnswer;
     const alreadyDelivered =
       result.status === "done" &&
       previousAnswer?.answer === result.answer &&
       previousAnswer.destinations.includes(destination);
-    const lastAnswer =
+    let lastAnswer =
       result.status === "done"
         ? {
             answer: result.answer,
@@ -310,13 +374,47 @@ export class Session {
           }
         : previousAnswer;
     if (result.status === "done" && !alreadyDelivered) {
-      const request = await this.conversation.commit(async (tx) => {
-        const answer = await tx.entry(AssistantEntry, result.answer);
-        if (!answer) throw new Error(`Missing answer for input ${input.id}`);
-        return readReply(tx, answer);
-      }, context);
-      const reply = await prepareReply(request, this.shutdown.signal);
-      await integration.reply(origin, reply, `${key}:answer`);
+      try {
+        const request = await this.conversation.commit(async (tx) => {
+          const answer = await tx.entry(AssistantEntry, result.answer);
+          if (!answer) throw new Error(`Missing answer for input ${input.id}`);
+          return readReply(tx, answer);
+        }, context);
+        const reply = await prepareReply(request, this.shutdown.signal);
+        await integration.reply(origin, reply, `${key}:answer`);
+      } catch (error) {
+        if (!(error instanceof MissingReplyManifest)) throw error;
+        this.setTyping(undefined);
+        const previousFailure = this.delivery.lastFailure;
+        const failedDestinations =
+          previousFailure?.answer === result.answer ? previousFailure.destinations : [];
+        const alreadyFailed = failedDestinations.includes(destination);
+        const failure = {
+          input: input.id,
+          answer: result.answer,
+          reason: "missing_reply_manifest" as const,
+          destinations: [...new Set([...failedDestinations, destination])],
+        };
+        await this.conversation.commit(async (tx) => {
+          const delivery = await tx.doc(Delivery, this.conversation.id);
+          delivery.lastFailure = failure;
+          delivery.lastHandledInput = input.id;
+        }, context);
+        this.delivery.lastFailure = failure;
+        this.delivery.lastHandledInput = input.id;
+        lastAnswer = previousAnswer;
+        if (!alreadyFailed) {
+          try {
+            await integration.reply(
+              origin,
+              { text: "Answer delivery failed: no saved reply manifest." },
+              `${this.conversation.id}:${result.answer}:${destination}:delivery-error`,
+            );
+          } catch (deliveryError) {
+            console.error("Failed to send terminal delivery error", deliveryError);
+          }
+        }
+      }
     } else if (result.status !== "done" && result.reason !== "aborted") {
       await integration.reply(
         origin,
@@ -329,29 +427,48 @@ export class Session {
       const delivery = await tx.doc(Delivery, this.conversation.id);
       delivery.lastHandledInput = input.id;
       if (lastAnswer) delivery.lastAnswer = lastAnswer;
-      delete delivery.progressIds;
+      delete delivery.announcement;
     }, context);
     this.delivery.lastHandledInput = input.id;
     if (lastAnswer) this.delivery.lastAnswer = lastAnswer;
-    delete this.delivery.progressIds;
+    delete this.delivery.announcement;
     this.tools.delete(input.id);
     return true;
   }
 
-  private async updateProgress(
+  private async announceTools(
     integration: DirectMessageIntegration,
     origin: MessageOrigin,
     input: EntryId,
     key: string,
   ): Promise<void> {
     const calls = [...(this.tools.get(input)?.values() ?? [])];
-    if (!calls.length) return;
-    const previous = this.delivery.progressIds ?? [];
-    const ids = await integration.progress(origin, calls, previous, key);
-    if (ids.length === previous.length && ids.every((id, index) => id === previous[index])) return;
-    await this.conversation.commit(async (tx) => {
-      (await tx.doc(Delivery, this.conversation.id)).progressIds = ids;
-    }, context);
-    this.delivery.progressIds = ids;
+    const count =
+      this.delivery.announcement?.input === input ? this.delivery.announcement.count : 0;
+    if (calls.length <= count) return;
+    const showTools = await this.conversation.commit(
+      async (tx) => (await tx.doc(SessionSettings, this.conversation.id)).showTools,
+      context,
+    );
+    for (const [index, call] of calls.entries()) {
+      if (index < count) continue;
+      if (call === undefined) break;
+      if (showTools && call !== null) {
+        try {
+          await integration.notice(
+            origin,
+            call,
+            `${key}:${origin.platform}:${origin.channelId}:${call.id}`,
+          );
+        } catch (error) {
+          console.error("Tool notice failed", error);
+        }
+      }
+      const announcement = { input, count: index + 1 };
+      await this.conversation.commit(async (tx) => {
+        (await tx.doc(Delivery, this.conversation.id)).announcement = announcement;
+      }, context);
+      this.delivery.announcement = announcement;
+    }
   }
 }

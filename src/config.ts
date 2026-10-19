@@ -16,15 +16,7 @@ const botConfigSchema = z.strictObject({
   state_dir: pathSchema.default(
     join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "vane"),
   ),
-  herdr_socket: pathSchema.default(
-    process.env.HERDR_SOCKET_PATH ??
-      join(
-        process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
-        "herdr",
-        ...(process.env.HERDR_SESSION ? ["sessions", process.env.HERDR_SESSION] : []),
-        "herdr.sock",
-      ),
-  ),
+  agent_socket: pathSchema.optional(),
   /** Platform tables, keyed by platform name. Each platform parses its own. */
   platforms: z.record(z.string().regex(/^[a-z][a-z0-9_-]*$/), z.unknown()).default({}),
   memory: z

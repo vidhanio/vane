@@ -9,12 +9,10 @@ import {
   InteractionContextType,
   MessageFlags,
   Partials,
-  RESTJSONErrorCodes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type DMChannel,
   type PartialDMChannel,
-  type Message,
 } from "discord.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -38,7 +36,7 @@ const commands = (
   [
     ["stop", "stop the current response and cancel queued messages"],
     ["status", "show the shared session's activity, model and usage"],
-    ["tools", "toggle keeping tool-call messages after responses"],
+    ["tools", "enable or disable immutable tool notices"],
   ] as const
 ).map(([name, description]) =>
   new SlashCommandBuilder()
@@ -127,55 +125,12 @@ export class Discord implements Platform {
     this.updateTyping(this.stopping ? undefined : origin?.channelId);
   }
 
-  async progress(
-    origin: MessageOrigin,
-    calls: ToolActivity[],
-    ids: string[],
-    key: string,
-  ): Promise<string[]> {
+  async notice(origin: MessageOrigin, call: ToolActivity, key: string): Promise<void> {
     const channel = await this.channel(origin.channelId);
-    const parts = splitMessages(calls.map(toolText).join("\n"));
-    const updated: string[] = [];
-    for (const [index, content] of parts.entries()) {
-      const id = ids[index];
-      if (id && channel.messages.cache.get(id)?.content === content) {
-        updated.push(id);
-        continue;
-      }
-      let message: Message | undefined;
-      if (id) {
-        try {
-          message = await channel.messages.edit(id, { content });
-        } catch (error) {
-          if (!unknownMessage(error)) throw error;
-        }
-      }
-      if (!message) {
-        message = await channel.send({
-          content,
-          nonce: nonce(`${key}:${index}`),
-          enforceNonce: true,
-        });
-        if (message.content !== content)
-          message = await channel.messages.edit(message.id, { content });
-        this.refreshTyping();
-      }
-      updated.push(message.id);
+    for (const [index, content] of splitMessages(toolText(call)).entries()) {
+      await channel.send({ content, nonce: nonce(`${key}:${index}`), enforceNonce: true });
     }
-    await this.removeProgress(origin, ids.slice(parts.length));
-    return updated;
-  }
-
-  async removeProgress(origin: MessageOrigin, ids: string[]): Promise<void> {
-    if (!ids.length) return;
-    const channel = await this.channel(origin.channelId);
-    for (const id of ids) {
-      try {
-        await channel.messages.delete(id);
-      } catch (error) {
-        if (!unknownMessage(error)) throw error;
-      }
-    }
+    this.refreshTyping();
   }
 
   async reply(origin: MessageOrigin, message: Reply, key: string): Promise<void> {
@@ -286,8 +241,8 @@ export class Discord implements Platform {
         case "tools":
           await interaction.editReply(
             (await this.session.toggleTools())
-              ? "Tools on: tool-call messages will stay in the channel."
-              : "Tools off: tool-call messages will be deleted before responses.",
+              ? "Tools on: immutable tool notices are enabled."
+              : "Tools off: new tool notices are disabled.",
           );
           break;
         case "status":
@@ -315,8 +270,4 @@ export class Discord implements Platform {
 
 function nonce(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 24);
-}
-
-function unknownMessage(error: unknown): boolean {
-  return error instanceof DiscordAPIError && error.code === RESTJSONErrorCodes.UnknownMessage;
 }

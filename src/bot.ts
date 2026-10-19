@@ -10,7 +10,8 @@ import { lock } from "proper-lockfile";
 import type { BotConfig } from "./config.ts";
 import { botTools } from "./tools.ts";
 import { log } from "./log.ts";
-import { Session } from "./session.ts";
+import { Session, toolNotices } from "./session.ts";
+import { replyTool } from "./reply.ts";
 import { MemoryAgent } from "./memory/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -44,7 +45,33 @@ export class Bot {
       registry.install(botTools(config));
       const memory = new MemoryAgent(config, models);
       registry.install(memory.extension());
+      registry.install(
+        toolNotices(
+          registry
+            .snapshot()
+            .tools()
+            .map(({ tool }) => tool),
+        ),
+      );
       const storage = await openNodeSqliteStorage(join(config.state_dir, "vane.sqlite"));
+      try {
+        let cursor;
+        do {
+          const page = await storage.scanTasks({ background: true }, 100, cursor, context);
+          if (
+            page.items.some(
+              (task) => task.state.status !== "terminal" && !registry.snapshot().task(task.kind),
+            )
+          )
+            throw new Error(
+              "Background tasks use an unavailable definition. Drain or abort them with the previous executable before upgrading.",
+            );
+          cursor = page.next;
+        } while (cursor);
+      } catch (error) {
+        await storage.close(context);
+        throw error;
+      }
       const harness = await Harness.open(
         storage,
         {
@@ -76,6 +103,10 @@ export class Bot {
           },
         })
         .then(async (conversation) => {
+          if (
+            !(await conversation.agent(context)).tools.some((tool) => tool.name === replyTool.name)
+          )
+            throw new Error("The configured toolset must include reply.");
           await memory.bind(conversation, harness);
           return Session.open(conversation);
         })

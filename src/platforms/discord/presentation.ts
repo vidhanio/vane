@@ -8,15 +8,17 @@ import {
 } from "@earendil-works/pi-durable";
 import { codeBlock, Colors, EmbedBuilder, escapeCodeBlock, inlineCode, subtext } from "discord.js";
 import { stripVTControlCharacters } from "node:util";
-import { z } from "zod";
 import type { ToolActivity } from "../index.ts";
-
-const toolDetails = z.object({ agent: z.string().optional(), workspace: z.string().optional() });
 
 function inline(value: unknown): string {
   const text = typeof value === "string" ? value : "";
   return inlineCode(
-    stripVTControlCharacters(text).replaceAll("`", "").replace(/\s+/g, " ").trim().toWellFormed(),
+    stripVTControlCharacters(text)
+      .replace(/[\p{Cc}\p{Cf}`]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 500)
+      .toWellFormed(),
   );
 }
 
@@ -27,11 +29,6 @@ export function errorText(error: unknown): string {
 
 export function toolText(call: ToolActivity): string {
   const args = call.arguments;
-  const parsed = toolDetails.safeParse(call.details);
-  const details = parsed.success ? parsed.data : undefined;
-  const agent = inline(details?.agent ?? args.agent_target ?? args.agent_name);
-  const workspace = details?.workspace ?? args.workspace_id;
-  const location = typeof workspace === "string" ? ` in ${inline(workspace)}` : "";
   let text: string;
   switch (call.name) {
     case "read":
@@ -46,26 +43,20 @@ export function toolText(call: ToolActivity): string {
     case "bash":
       text = `running ${inline(args.command)}`;
       break;
-    case "herdr_list":
-      text = "getting herdr status";
+    case "agent_create":
+      text = `creating agent ${inline(args.name)} at ${inline(args.path)}`;
       break;
-    case "herdr_create_workspace":
-      text = `creating workspace ${inline(args.workspace_name)} at ${inline(args.project_path)}`;
+    case "agent_status":
+      text = args.id === undefined ? "checking agents" : `checking agent ${inline(args.id)}`;
       break;
-    case "herdr_create_agent":
-      text = `creating agent ${agent}${location}`;
+    case "agent_delete":
+      text = `deleting agent ${inline(args.id)}`;
       break;
-    case "herdr_delete_agent":
-      text = `deleting agent pane ${agent}${location}`;
+    case "agent_delegate":
+      text = `delegating to agent ${inline(args.id)}`;
       break;
-    case "herdr_delegate":
-      text = `delegating to ${agent}${location}`;
-      break;
-    case "herdr_subscribe":
-      text = `subscribing to ${agent}${location}`;
-      break;
-    case "herdr_read":
-      text = `reading status of ${agent}${location}`;
+    case "agent_subscribe":
+      text = `subscribing to agent ${inline(args.id)}`;
       break;
     default:
       text = `using ${inline(call.name)}`;

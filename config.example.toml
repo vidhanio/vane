@@ -1,5 +1,5 @@
 state_dir = "~/.local/state/vane"
-herdr_socket = "~/.config/herdr/herdr.sock"
+agent_socket = "~/.config/herdr/herdr.sock"
 
 [platforms.discord]
 token = "${DISCORD_TOKEN}"
