@@ -21,7 +21,8 @@ import {
   type MessageOrigin,
 } from "./messages.ts";
 import type { DirectMessageIntegration, ToolActivity } from "./platforms/index.ts";
-import { MissingReplyManifest, readReply, replyTool } from "./reply.ts";
+import { answerText, readReply, replyTool } from "./reply.ts";
+import { log } from "./log.ts";
 import { ToolAdmission } from "./tool-notices.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -327,16 +328,19 @@ export class Session {
           }
         : previousAnswer;
     if (result.status === "done" && !alreadyDelivered) {
-      try {
-        const request = await this.conversation.commit(async (tx) => {
-          const answer = await tx.entry(AssistantEntry, result.answer);
-          if (!answer) throw new Error(`Missing answer for input ${input.id}`);
-          return readReply(tx, answer);
-        }, context);
+      const request = await this.conversation.commit(async (tx) => {
+        const answer = await tx.entry(AssistantEntry, result.answer);
+        if (!answer) throw new Error(`Missing answer for input ${input.id}`);
+        const manifest = await readReply(tx, answer);
+        if (manifest) return manifest;
+        const fallback = answerText(answer);
+        if (fallback) log("reply.fallback", { input: input.id, answer: answer.id });
+        return fallback;
+      }, context);
+      if (request) {
         const reply = await prepareReply(request, this.shutdown.signal);
         await integration.reply(origin, reply, `${key}:answer`);
-      } catch (error) {
-        if (!(error instanceof MissingReplyManifest)) throw error;
+      } else {
         this.setTyping(undefined);
         const previousFailure = this.delivery.lastFailure;
         const failedDestinations =

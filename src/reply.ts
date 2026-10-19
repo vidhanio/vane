@@ -81,13 +81,7 @@ export const replyTool = defineTool({
   },
 });
 
-export class MissingReplyManifest extends Error {
-  constructor(answer: EntryId) {
-    super(`Missing reply manifest for answer ${answer}`);
-  }
-}
-
-export async function readReply(tx: Tx, answer: EntryRecord): Promise<ReplyRequest> {
+export async function readReply(tx: Tx, answer: EntryRecord): Promise<ReplyRequest | undefined> {
   let cursor: Cursor | undefined;
   do {
     const page = await tx.scanEntries(
@@ -97,10 +91,18 @@ export async function readReply(tx: Tx, answer: EntryRecord): Promise<ReplyReque
     );
     for (const entry of page.items) {
       if (ReplyManifest.is(entry) && entry.data.answer === answer.id) return entry.data;
-      if (AssistantEntry.is(entry) && entry.id !== answer.id)
-        throw new MissingReplyManifest(answer.id);
+      if (AssistantEntry.is(entry) && entry.id !== answer.id) return undefined;
     }
     cursor = page.next;
   } while (cursor);
-  throw new MissingReplyManifest(answer.id);
+  return undefined;
+}
+
+export function answerText(answer: EntryRecord): ReplyRequest | undefined {
+  const text = (answer.model ?? [])
+    .flatMap((message) => (message.role === "assistant" ? message.content : []))
+    .flatMap((block) => (block.type === "text" ? [block.text] : []))
+    .join("\n\n")
+    .trim();
+  return text ? { text, attachments: [] } : undefined;
 }
