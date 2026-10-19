@@ -1,3 +1,9 @@
+import {
+  awaitWithContext,
+  BACKGROUND_CONTEXT,
+  withAbortSignal,
+} from "@earendil-works/chord/context";
+
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -59,16 +65,10 @@ export class CacheGate {
       signal?.throwIfAborted();
       const previous = [...this.pending].find(([key]) => prefix.startsWith(key))?.[1];
       if (!previous) break;
-      let abort = noop;
-      const cancelled = new Promise<never>((_resolve, reject) => {
-        abort = () => reject(new Error("Cache wait cancelled"));
-        signal?.addEventListener("abort", abort, { once: true });
-      });
-      try {
-        await Promise.race([previous, cancelled]);
-      } finally {
-        signal?.removeEventListener("abort", abort);
-      }
+      await awaitWithContext(
+        previous,
+        signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT,
+      );
     }
     let release = noop;
     const pending = new Promise<void>((resolve) => {

@@ -24,13 +24,6 @@ export function split(text: string): string[] {
   return parts;
 }
 
-export function clip(text: string): string {
-  const characters = Array.from(text);
-  if (characters.length <= 30_000) return text;
-  const notice = `\n[${characters.length - 14_950 * 2} characters omitted; head and tail retained]\n`;
-  return characters.slice(0, 14_950).join("") + notice + characters.slice(-14_950).join("");
-}
-
 export class Memory {
   readonly store: Store;
   readonly chat: View;
@@ -91,7 +84,19 @@ export class Memory {
     return this.lock.runExclusive(async () => {
       this.check();
       const existing = this.store.receipts.get(receipt);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) {
+        const record = this.store.records[existing];
+        if (
+          !record ||
+          record.kind !== kind ||
+          record.text !== text ||
+          record.date !== date ||
+          record.source.entry !== source.entry ||
+          record.source.message !== source.message
+        )
+          throw new Error(`Memory receipt ${receipt} does not match its original message`);
+        return existing;
+      }
       const i = this.store.records.length;
       try {
         await this.store.appendRecord({
@@ -237,8 +242,8 @@ export class Memory {
 
   async settle(boundary: number, signal?: AbortSignal): Promise<void> {
     this.check();
-    if (this.frontier >= boundary) return;
     signal?.throwIfAborted();
+    if (this.frontier >= boundary) return;
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         this.events.off("change", check);
@@ -309,6 +314,6 @@ export class Memory {
     this.controller.abort();
     this.events.emit("change");
     await Promise.allSettled(this.active.values());
-    await this.store.close();
+    await this.lock.runExclusive(() => this.store.close());
   }
 }

@@ -78,6 +78,8 @@ export function createCompressor(
       });
     }
     if (!shortest) throw new Error("Compactor returned no whole line in five attempts");
-    return shortest;
+    throw new Error(
+      `Compactor exceeded the 512-byte limit in five attempts (${bytes(shortest)} bytes)`,
+    );
   };
 }

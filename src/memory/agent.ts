@@ -1,4 +1,8 @@
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+  awaitWithContext,
+  BACKGROUND_CONTEXT,
+  withAbortSignal,
+} from "@earendil-works/chord/context";
 import {
   getCurrentSystemMessage,
   Type,
@@ -14,6 +18,7 @@ import {
   LiveDoc,
   ProviderDoc,
   UsageDoc,
+  SessionFailed,
   type Conversation,
   type EntryId,
   type EntryRecord,
@@ -21,15 +26,15 @@ import {
 } from "@earendil-works/pi-durable";
 import { Mutex } from "async-mutex";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { BotConfig } from "../config.ts";
 import { AgentNotification } from "../messages.ts";
 import { requestModels, zeroUsage } from "./models.ts";
 import { createCompressor } from "./compactor.ts";
-import { clip, Memory, split } from "./index.ts";
+import { Memory, split } from "./index.ts";
 import type { Kind } from "./store.ts";
 
 const context = BACKGROUND_CONTEXT;
-const noop = () => {};
 const Archive = defineDoc<{
   count: number;
   cursor?: EntryId;
@@ -144,20 +149,10 @@ export class MemoryAgent {
       createCompressor(
         this.cachedModels,
         this.config.memory,
-        async (signal) => {
-          if (this.system) return this.system;
-          signal.throwIfAborted();
-          let abort = noop;
-          const cancelled = new Promise<never>((_resolve, reject) => {
-            abort = () => reject(new Error("Compaction cancelled"));
-            signal.addEventListener("abort", abort, { once: true });
-          });
-          try {
-            return await Promise.race([this.promptReady.promise, cancelled]);
-          } finally {
-            signal.removeEventListener("abort", abort);
-          }
-        },
+        (signal) =>
+          this.system
+            ? Promise.resolve(this.system)
+            : awaitWithContext(this.promptReady.promise, withAbortSignal(signal, context)),
         (usage) => this.recordUsage(usage),
         sessionId,
       ),
@@ -209,13 +204,19 @@ export class MemoryAgent {
     this.background = (async () => {
       while (this.dirty && !this.shutdown.signal.aborted) {
         this.dirty = false;
-        await this.sync();
+        try {
+          await this.sync();
+        } catch (error) {
+          if (this.shutdown.signal.aborted) return;
+          console.error("Memory archive failed", error);
+          if (error instanceof SessionFailed) return;
+          this.dirty = true;
+          await delay(5000, undefined, { signal: this.shutdown.signal }).catch(() => undefined);
+        }
       }
-    })()
-      .catch((error: unknown) => console.error("Memory archive failed", error))
-      .finally(() => {
-        this.background = undefined;
-      });
+    })().finally(() => {
+      this.background = undefined;
+    });
   }
 
   private sync(): Promise<void> {
@@ -253,7 +254,7 @@ export class MemoryAgent {
       block: string,
       timestamp: number,
     ) => {
-      const parts = kind === "echo" ? [clip(text)] : split(text);
+      const parts = split(text);
       for (const [piece, part] of parts.entries()) {
         const i = await memory.append(
           kind,
@@ -316,10 +317,11 @@ export class MemoryAgent {
   private async project(messages: readonly Message[], signal?: AbortSignal): Promise<Message[]> {
     const conversation = this.conversation;
     if (!conversation) throw new Error("Memory is not bound to the conversation");
+    signal?.throwIfAborted();
     this.system = getCurrentSystemMessage(messages);
     if (!this.system) throw new Error("Missing system prompt for memory turn");
     this.promptReady.resolve(this.system);
-    await this.sync();
+    await awaitWithContext(this.sync(), signal ? withAbortSignal(signal, context) : context);
     const memory = this.requireMemory();
     const first = await conversation.commit(
       async (tx) => (await tx.doc(LiveDoc, conversation.id)).run?.inputs[0],

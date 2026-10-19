@@ -81,6 +81,7 @@ export function requestModels(
           if (event.type !== "start") release();
           output.push(event);
         }
+        output.end(await stream.result());
       } catch (error) {
         const reason = options?.signal?.aborted ? "aborted" : "error";
         output.push({
