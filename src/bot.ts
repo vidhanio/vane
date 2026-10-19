@@ -10,7 +10,8 @@ import { lock } from "proper-lockfile";
 import type { BotConfig } from "./config.ts";
 import { botTools } from "./tools.ts";
 import { log } from "./log.ts";
-import { Session, toolNotices } from "./session.ts";
+import { Session } from "./session.ts";
+import { toolNotices } from "./tool-notices.ts";
 import { replyTool } from "./reply.ts";
 import { MemoryAgent } from "./memory/agent.ts";
 

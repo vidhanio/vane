@@ -1,8 +1,10 @@
 import { Type } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
+  defineDoc,
   defineEntry,
   defineTool,
+  ToolTask,
   type Cursor,
   type EntryId,
   type EntryRecord,
@@ -12,6 +14,12 @@ import { resolve } from "node:path";
 import { attachmentCountLimit, type ReplyRequest } from "./attachments.ts";
 
 const ReplyManifest = defineEntry<ReplyRequest & { answer: EntryId }>("vane.reply");
+const ReplyReceipt = defineDoc<{ saved: boolean }>({
+  kind: "vane.reply.receipt",
+  version: 1,
+  scope: "task",
+  initial: () => ({ saved: false }),
+});
 
 export const replyTool = defineTool({
   name: "reply",
@@ -40,27 +48,31 @@ export const replyTool = defineTool({
     const cwd = api.env?.cwd ?? (await api.agent(context)).cwd ?? process.cwd();
     const attachments = [...new Set(args.attachments.map((path) => resolve(cwd, path)))];
     await api.commit(async (tx) => {
-      let cursor: Cursor | undefined;
-      do {
-        const page = await tx.scanEntries({ conversationId: api.conversationId }, 100, cursor);
-        for (const entry of page.items) {
-          if (ReplyManifest.is(entry) && entry.byTaskId === api.taskId) return;
-          if (!AssistantEntry.is(entry)) continue;
-          const calls = entry.model?.flatMap((message) =>
-            message.role === "assistant"
-              ? message.content.filter((block) => block.type === "toolCall")
-              : [],
-          );
-          if (calls?.length !== 1 || calls[0]?.id !== api.callId)
-            throw new Error("Call reply alone, after all other tools have finished.");
-          await tx.appendEntry(ReplyManifest, api.conversationId, {
-            data: { answer: entry.id, text: args.text, attachments },
-          });
-          return;
-        }
-        cursor = page.next;
-      } while (cursor);
-      throw new Error("Missing assistant entry for reply.");
+      const receipt = await tx.doc(ReplyReceipt, api.taskId);
+      if (receipt.saved) return;
+      const task = await tx.task(api.taskId);
+      const input = task?.kind === ToolTask.definition.name ? task?.input : undefined;
+      if (
+        !input ||
+        typeof input !== "object" ||
+        Array.isArray(input) ||
+        input.kind !== "model" ||
+        typeof input.assistant !== "number"
+      )
+        throw new Error("Missing model tool task for reply.");
+      const entry = await tx.entry(AssistantEntry, input.assistant as EntryId);
+      if (!entry) throw new Error("Missing assistant entry for reply.");
+      const calls = entry.model?.flatMap((message) =>
+        message.role === "assistant"
+          ? message.content.filter((block) => block.type === "toolCall")
+          : [],
+      );
+      if (calls?.length !== 1 || calls[0]?.id !== api.callId)
+        throw new Error("Call reply alone, after all other tools have finished.");
+      await tx.appendEntry(ReplyManifest, api.conversationId, {
+        data: { answer: entry.id, text: args.text, attachments },
+      });
+      receipt.saved = true;
     }, context);
     return {
       output: [{ type: "text", text: "Reply saved for delivery." }],
