@@ -1,7 +1,6 @@
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { parse } from "smol-toml";
 import { z } from "zod";
 
 export const pathSchema = z
@@ -36,7 +35,9 @@ const botConfigSchema = z.strictObject({
 export type BotConfig = z.infer<typeof botConfigSchema>;
 
 export async function loadConfig(file: string): Promise<BotConfig> {
-  const config = botConfigSchema.parse(expandEnvironment(parse(await Bun.file(file).text())));
+  const config = botConfigSchema.parse(
+    expandEnvironment(Bun.TOML.parse(await Bun.file(file).text())),
+  );
   if (!(await stat(config.agent.cwd)).isDirectory())
     throw new Error(`Not a directory: ${config.agent.cwd}`);
   return config;
