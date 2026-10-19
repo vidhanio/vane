@@ -15,6 +15,7 @@ import {
   type PartialDMChannel,
 } from "discord.js";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import type { Reply } from "../../attachments.ts";
@@ -65,10 +66,10 @@ export class Discord implements Platform {
     this.config = configSchema.parse(config);
   }
 
-  async start(): Promise<void> {
-    const ready = new Promise<void>((resolve) =>
-      this.client.once(Events.ClientReady, () => resolve()),
-    );
+  async start(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const startup = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
+    const ready = once(this.client, Events.ClientReady, { signal: startup });
     this.client.on(Events.Error, (error) => console.error("Discord error", error));
     this.client.on(Events.MessageCreate, (message) => {
       if (
@@ -83,7 +84,7 @@ export class Discord implements Platform {
         this.session
           .submit(
             { platform: this.name, channelId: message.channelId, messageId: message.id },
-            (signal) => messageContent(message, signal, this.attachmentDirectory),
+            (preparation) => messageContent(message, preparation, this.attachmentDirectory),
           )
           .catch(async (error: unknown) => {
             console.error("Discord submission failed", error);
@@ -99,10 +100,11 @@ export class Discord implements Platform {
       if (!this.stopping && interaction.isChatInputCommand())
         this.track(this.handleCommand(interaction));
     });
-    await this.client.login(this.config.token);
-    await ready;
+    await Promise.all([ready, this.client.login(this.config.token)]);
+    startup.throwIfAborted();
     if (!this.client.application) throw new Error("Discord application is unavailable");
     await this.client.application.commands.set(commands.map((command) => command.toJSON()));
+    startup.throwIfAborted();
     this.stopping = false;
     this.session.connect(this);
     log("discord.connected", { userId: this.client.user?.id });

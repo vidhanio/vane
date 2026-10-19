@@ -12,7 +12,7 @@ export interface DirectMessageIntegration {
 }
 
 export interface Platform extends DirectMessageIntegration {
-  start(): Promise<void>;
+  start(signal: AbortSignal): Promise<void>;
   stop(): Promise<void>;
   close(): Promise<void>;
 }
