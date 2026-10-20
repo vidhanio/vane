@@ -10,6 +10,7 @@ import {
   type EntryRecord,
   type Tx,
 } from "@earendil-works/pi-durable";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { attachmentCountLimit, type ReplyRequest } from "./attachments.ts";
 
@@ -46,7 +47,11 @@ export const replyTool = defineTool({
   replay: "safe",
   async execute(args, api, context) {
     const cwd = api.env?.cwd ?? (await api.agent(context)).cwd ?? process.cwd();
-    const attachments = [...new Set(args.attachments.map((path) => resolve(cwd, path)))];
+    const attachments = [
+      ...new Set(
+        args.attachments.map((path) => resolve(cwd, path.replace(/^~(?=\/|$)/, homedir()))),
+      ),
+    ];
     await api.commit(async (tx) => {
       const receipt = await tx.doc(ReplyReceipt, api.taskId);
       if (receipt.saved) return;
