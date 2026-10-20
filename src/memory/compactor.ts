@@ -6,6 +6,7 @@ import {
   type SystemMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
+import { setTimeout as delay } from "node:timers/promises";
 import type { BotConfig } from "../config.ts";
 import type { Compressor } from "./index.ts";
 import { bytes, children, end, label, start } from "./view.ts";
@@ -41,7 +42,8 @@ export function createCompressor(
     ];
     let shortest: string | undefined;
     const thinking = clampThinkingLevel(model, choice.thinking);
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < 5;) {
+      signal.throwIfAborted();
       const reply = await models
         .streamSimple(
           model,
@@ -51,13 +53,25 @@ export function createCompressor(
             sessionId,
             cacheRetention: "short",
             transport: "sse",
+            toolChoice: "none",
             ...(thinking === "off" ? {} : { reasoning: thinking }),
           },
         )
         .result();
       await onUsage(reply.usage);
-      if (reply.stopReason === "error" || reply.stopReason === "aborted")
-        throw new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
+      signal.throwIfAborted();
+      if (reply.stopReason === "aborted")
+        throw new Error(reply.errorMessage ?? "Compactor aborted");
+      if (reply.stopReason === "error") {
+        if (
+          ["refusal", "sensitive", "incomplete.content_filter"].includes(reply.rawStopReason ?? "")
+        )
+          throw new Error(reply.errorMessage ?? "Compactor refused the input");
+        console.error("Memory compactor unavailable; retrying in 60 seconds", reply.errorMessage);
+        await delay(60_000, undefined, { signal });
+        continue;
+      }
+      attempt++;
       if (reply.stopReason === "length" || reply.content.some((block) => block.type === "toolCall"))
         continue;
       const text = contentText(reply.content, "")
@@ -66,12 +80,11 @@ export function createCompressor(
       if (!text) throw new Error("Compactor returned no summary");
       if (shortest === undefined || bytes(text) < bytes(shortest)) shortest = text;
       if (bytes(text) <= 512) return text;
-      messages.push(reply);
       const cut = Buffer.from(text)
         .subarray(0, 512)
         .toString("utf8")
         .replace(/\uFFFD$/, "");
-      messages.push({
+      messages.splice(2, messages.length - 2, {
         role: "user",
         content: `Too long: your line is ${bytes(text)} bytes, over the 512-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${cut}| ← LIMIT`,
         timestamp: 0,

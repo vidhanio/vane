@@ -25,4 +25,5 @@ Use the space up to the limit, prioritizing:
 2. Anything with lasting effect, and what failed and why.
 3. Findings, open questions and vane's replies.
 4. Tool steps: what was done to what, and the outcome.
-Name minor items rather than omit them. Copy names, numbers, ids, paths and errors exactly. Tag items with their kind and credit quotations to their real author. Never make anything look further along than it was. If told the line is too long, shorten it. Non-ASCII characters cost 2-4 bytes.`;
+Name minor items rather than omit them. Copy names, numbers, ids, paths and errors exactly. Tag items with their kind and credit quotations to their real author. Never make anything look further along than it was. If told the line is too long, shorten it. Non-ASCII characters cost 2-4 bytes.
+This is a small, mechanical job: fit one message or two lines into at most 512 bytes, dropping the least important bits. Read <chat> only as far as it tells you what to keep. Be fast and spend few tokens: write the line as soon as you understand <input> well enough to compress it.`;

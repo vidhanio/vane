@@ -5,6 +5,7 @@ import { bytes, children, end, key, label, parent, start, View, type Part } from
 
 type Compression = { part: Part; source: string; view: string };
 export type Compressor = (input: Compression, signal: AbortSignal) => Promise<string>;
+const context = (part: Part) => (part[0] === 0 ? start(part) : end(part));
 
 export function split(text: string): string[] {
   const parts: string[] = [];
@@ -60,11 +61,9 @@ export class Memory {
       memory.compaction.parts = saved.compaction;
       memory.compaction.merging = saved.compacting;
     }
-    for (const view of [memory.chat, memory.compaction]) {
-      const last = view.parts.at(-1);
-      const covered = last ? end(last) : 0;
-      for (let i = covered; i < memory.store.records.length; i++) view.parts.push([0, i]);
-    }
+    const last = memory.chat.parts.at(-1);
+    const covered = last ? end(last) : 0;
+    for (let i = covered; i < memory.store.records.length; i++) memory.chat.parts.push([0, i]);
     for (let i = 0; i < memory.store.records.length; i++)
       if (!memory.store.nodes.has(key([0, i]))) memory.leaves.add(i);
     for (const node of memory.store.nodes.values()) memory.queueParent([node.l, node.i]);
@@ -109,10 +108,9 @@ export class Memory {
           source,
         });
         this.chat.parts.push([0, i]);
-        this.compaction.parts.push([0, i]);
         this.leaves.add(i);
         this.failed.clear();
-        await this.save();
+        await this.save(true);
       } catch (error) {
         this.fatal = error;
         this.events.emit("change");
@@ -128,9 +126,9 @@ export class Memory {
     if (this.fatal) throw this.fatal;
   }
 
-  private save(): Promise<void> {
-    const merged = this.chat.fit(this.store.records.length);
-    this.compaction.fit(this.store.records.length, merged);
+  private save(next = false): Promise<void> {
+    this.chat.fit(this.store.records.length, next);
+    this.compaction.fit(this.frontier, next);
     return this.store.save({
       nodes: this.store.nodes.size,
       parts: this.chat.parts,
@@ -146,6 +144,11 @@ export class Memory {
       this.store.nodes.has(key([0, this.frontier]))
     )
       this.frontier++;
+    const parts = this.compaction.parts;
+    const crossing = parts.findIndex((part) => end(part) > this.frontier);
+    if (crossing >= 0) parts.splice(crossing);
+    const last = parts.at(-1);
+    for (let i = last ? end(last) : 0; i < this.frontier; i++) parts.push([0, i]);
   }
 
   private queueParent(part: Part): void {
@@ -183,12 +186,14 @@ export class Memory {
         });
       this.active.set(id, work);
     };
-    let ahead = 0;
-    for (const i of this.leaves) {
-      if (ahead++ >= 8 || this.active.size >= 8) break;
-      run([0, i]);
-    }
-    for (const part of this.merges.values()) {
+    const leaves = [...this.leaves].slice(0, 8);
+    const boundary = leaves.at(-1) ?? this.store.records.length;
+    const ready: Part[] = [
+      ...leaves.map((i): Part => [0, i]),
+      ...[...this.merges.values()].filter((part) => context(part) <= boundary),
+    ];
+    ready.sort((a, b) => context(a) - context(b) || b[0] - a[0]);
+    for (const part of ready) {
       if (this.active.size >= 8) break;
       run(part);
     }
@@ -207,7 +212,7 @@ export class Memory {
         .map((child) => {
           const node = this.store.nodes.get(key(child));
           if (!node) throw new Error("Missing child summary");
-          return node.text;
+          return node.text.replace(/\s*\n\s*/g, " ");
         })
         .join("\n");
     }
@@ -222,6 +227,7 @@ export class Memory {
             )
           ).trim();
     if (!text) throw new Error("Compactor returned an empty summary");
+    if (bytes(text) > 512) throw new Error("Compactor exceeded the 512-byte node limit");
     if (this.stopped) return;
     await this.lock.runExclusive(async () => {
       this.check();

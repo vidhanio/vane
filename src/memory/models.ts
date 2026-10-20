@@ -1,11 +1,10 @@
 import {
   createAssistantMessageEventStream,
-  getCurrentSystemMessage,
   type Message,
   type Models,
   type Usage,
 } from "@earendil-works/pi-ai";
-import { cachePayload, CacheGate } from "./cache.ts";
+import { cacheKeys, cachePayload, CacheGate, type Flight } from "./cache.ts";
 
 const noop = () => {};
 
@@ -32,32 +31,11 @@ export function requestModels(
   wrapped.streamSimple = (model, input, options) => {
     const output = createAssistantMessageEventStream();
     void (async () => {
-      let release = noop;
+      let flight: Flight = { begun: noop, end: noop };
       try {
         const messages = settings.project
           ? await settings.project(input.messages, options?.signal)
           : input.messages;
-        if (settings.cache && model.api === "anthropic-messages") {
-          const prompt = getCurrentSystemMessage(messages);
-          const view = messages.find(
-            (message) =>
-              message.role === "user" &&
-              Array.isArray(message.content) &&
-              message.content.some(
-                (block) => block.type === "text" && block.text.startsWith("<chat>\n"),
-              ),
-          );
-          const blocks = view?.role === "user" && Array.isArray(view.content) ? view.content : [];
-          const text = blocks.find((block) => block.type === "text")?.text ?? "";
-          const lines = text.split("\n");
-          const whole = lines
-            .slice(0, Math.max(0, Math.floor((lines.length - 2) / 4) * 4 + 1))
-            .join("\n");
-          release = await gate.enter(
-            `${model.provider}/${model.id}/${options?.reasoning ?? "off"}/${JSON.stringify(prompt)}\n${whole}`,
-            options?.signal,
-          );
-        }
         const stream = models.streamSimple(
           model,
           { ...input, messages: [...messages] },
@@ -69,16 +47,32 @@ export function requestModels(
                   transport: "sse",
                   onPayload: async (payload, selected) => {
                     const transformed = (await options?.onPayload?.(payload, selected)) ?? payload;
-                    return selected.api === "anthropic-messages"
-                      ? cachePayload(transformed)
-                      : transformed;
+                    if (selected.api !== "anthropic-messages") return transformed;
+                    const cached = cachePayload(transformed);
+                    flight.end();
+                    flight = await gate.enter(
+                      cacheKeys(cached, `${selected.provider}/${selected.baseUrl}`),
+                      options?.signal,
+                    );
+                    return cached;
+                  },
+                  onProviderStreamEvent: async (event, selected) => {
+                    if (
+                      selected.api === "anthropic-messages" &&
+                      typeof event === "object" &&
+                      event !== null &&
+                      "type" in event &&
+                      event.type === "message_start"
+                    )
+                      flight.begun();
+                    await options?.onProviderStreamEvent?.(event, selected);
                   },
                 }
               : {}),
           },
         );
         for await (const event of stream) {
-          if (event.type !== "start") release();
+          if (event.type !== "start" && event.type !== "error") flight.begun();
           output.push(event);
         }
         output.end(await stream.result());
@@ -100,7 +94,7 @@ export function requestModels(
           },
         });
       } finally {
-        release();
+        flight.end();
       }
     })();
     return output;

@@ -28,8 +28,7 @@ export class View {
 
   line(part: Part): string {
     const node = this.node(part);
-    if (!node) throw new Error(`Memory node ${label(part)} is not built`);
-    return line(part, node.text);
+    return line(part, node?.text ?? "(not summarized yet: zoom it)");
   }
 
   render(boundary = Infinity): string {
@@ -47,22 +46,21 @@ export class View {
   }
 
   get size(): number {
-    return (
-      16 +
-      this.parts.reduce((sum, part) => sum + bytes(line(part, this.node(part)?.text ?? "")) + 1, 0)
-    );
+    return this.parts.reduce((sum, part) => sum + (this.node(part)?.size ?? 0), 0);
   }
 
-  fit(total: number, force = false): boolean {
-    let size = this.size;
-    if (force || size > this.high) this.merging = true;
+  fit(total: number, next = false): boolean {
+    const before = this.size;
+    if (before <= this.high && !(next && this.merging)) return false;
+    let size = before;
+    const parts = [...this.parts];
     let changed = false;
-    while (this.merging && size > this.low) {
+    while (size > this.low) {
       let best = -1;
       let due = -Infinity;
-      for (let j = 0; j + 1 < this.parts.length; j++) {
-        const a = this.parts[j];
-        const b = this.parts[j + 1];
+      for (let j = 0; j + 1 < parts.length; j++) {
+        const a = parts[j];
+        const b = parts[j + 1];
         if (!a || !b) continue;
         if (a[0] !== b[0] || a[1] % 2 !== 0 || b[1] !== a[1] + 1) continue;
         const age = (total - (end(b) - 1)) / 2 ** a[0];
@@ -72,15 +70,21 @@ export class View {
         }
       }
       if (best < 0) break;
-      const a = this.parts[best];
-      const b = this.parts[best + 1];
+      const a = parts[best];
+      const b = parts[best + 1];
       if (!a || !b) break;
       const merged = parent(a);
-      size += bytes(this.line(merged)) - bytes(this.line(a)) - bytes(this.line(b)) - 1;
-      this.parts.splice(best, 2, merged);
+      size +=
+        (this.node(merged)?.size ?? 0) - (this.node(a)?.size ?? 0) - (this.node(b)?.size ?? 0);
+      parts.splice(best, 2, merged);
       changed = true;
     }
-    if (size <= this.low) this.merging = false;
+    if (!next && size > Math.max(this.low, before - this.high)) {
+      this.merging = before > this.low;
+      return false;
+    }
+    this.parts = parts;
+    this.merging = size > this.low;
     return changed;
   }
 }
